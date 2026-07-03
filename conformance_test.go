@@ -35,6 +35,20 @@ func TestKVConformance(t *testing.T) {
 	})
 }
 
+// TestBlobsConformance runs the shared storekit Blobs conformance suite against
+// the filesystem Blobs backend. A fresh newBlobStore over a per-call t.TempDir
+// yields a fresh, empty key space, so every suite subtest is fully independent.
+func TestBlobsConformance(t *testing.T) {
+	t.Parallel()
+	storetest.TestBlobs(t, func(t *testing.T) storekit.Blobs {
+		s, err := newBlobStore(t.TempDir())
+		if err != nil {
+			t.Fatalf("newBlobStore: %v", err)
+		}
+		return s
+	})
+}
+
 // TestLeaserConformance runs the shared storekit leaser conformance suite against
 // the filesystem leaser backend. A fresh newLeaserStore over a per-call t.TempDir
 // yields a fresh, empty lease slot per name, so every suite subtest is independent.
