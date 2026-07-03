@@ -117,6 +117,7 @@ func encodeFrame(seq uint64, payload []byte) ([]byte, error) {
 		return nil, &FrameError{Fault: FaultOversize, Length: uint64(len(payload))}
 	}
 	frame := make([]byte, frameHeaderSize+len(payload))
+	// #nosec G115 -- guarded by the MaxFramePayload (16 MiB) check above, so len(payload) always fits uint32
 	binary.LittleEndian.PutUint32(frame[0:4], uint32(len(payload)))
 	binary.LittleEndian.PutUint32(frame[4:8], crc32.Checksum(payload, castagnoli))
 	binary.LittleEndian.PutUint64(frame[8:16], seq)

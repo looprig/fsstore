@@ -162,6 +162,28 @@ func newLedgerStore(root string) (*ledgerStore, error) {
 	return &ledgerStore{root: clean, streams: streams, files: make(map[string]*ledgerFile)}, nil
 }
 
+// Close releases the ledger backend's in-process state: it drops the cached
+// name->ledgerFile registry (the tip/size metadata observed after the last write).
+// The backend holds no long-lived file descriptors — every Append/Read/Tip/Delete
+// opens and closes its fd within the call (the per-append advisory-lock model) — so
+// there are no open handles to release; Close relinquishes the in-memory registry
+// and makes backend shutdown explicit. It is idempotent: it resets the registry to
+// an empty map, so a second call (or a stray operation after Close) is safe rather
+// than a nil-map panic.
+func (s *ledgerStore) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.files = make(map[string]*ledgerFile)
+	return nil
+}
+
+// ledgerIOErr adapts *LedgerIOError to the ioErrFunc the shared fsync helpers
+// expect, so a directory-fsync failure on a ledger path surfaces as a ledger-typed
+// IO error rather than another backend's.
+func ledgerIOErr(op, path string, cause error) error {
+	return &LedgerIOError{Op: op, Path: path, Cause: cause}
+}
+
 // pathFor maps a storekit name to its ledger file path under streams and verifies
 // the result stays within streams (containment / defense in depth). The name's
 // '/'-separated segments become path components; the file gains the .log suffix.
@@ -224,7 +246,7 @@ func (s *ledgerStore) Append(ctx context.Context, name string, expected uint64, 
 		return &LedgerIOError{Op: "mkdir", Path: dir, Cause: merr}
 	}
 
-	f, oerr := os.OpenFile(lf.path, os.O_RDWR|os.O_CREATE, 0o600)
+	f, oerr := os.OpenFile(lf.path, os.O_RDWR|os.O_CREATE, 0o600) // #nosec G304 -- lf.path is validated and contained under streams
 	if oerr != nil {
 		return &LedgerIOError{Op: "open", Path: lf.path, Cause: oerr}
 	}
@@ -270,7 +292,7 @@ func (s *ledgerStore) Append(ctx context.Context, name string, expected uint64, 
 		// On first creation the new dirents may reach up several levels (e.g.
 		// streams/sessions/<uuid>.log creates streams/sessions), so fsync the
 		// ancestor chain from the file's directory up to and including streams.
-		if derr := fsyncDirChain(dir, s.streams); derr != nil {
+		if derr := fsyncDirChain(dir, s.streams, ledgerIOErr); derr != nil {
 			return derr
 		}
 	}
@@ -341,7 +363,7 @@ func (s *ledgerStore) Read(ctx context.Context, name string, from uint64) (store
 	lf.mu.Lock()
 	defer lf.mu.Unlock()
 
-	data, err := os.ReadFile(lf.path) //nolint:gosec // path is validated and contained under streams
+	data, err := os.ReadFile(lf.path) // #nosec G304 -- path is validated and contained under streams
 	if errors.Is(err, fs.ErrNotExist) {
 		return &drainedCursor{}, nil // absent == empty
 	}
@@ -375,7 +397,7 @@ func (s *ledgerStore) Tip(ctx context.Context, name string) (uint64, error) {
 	lf.mu.Lock()
 	defer lf.mu.Unlock()
 
-	data, err := os.ReadFile(lf.path) //nolint:gosec // path is validated and contained under streams
+	data, err := os.ReadFile(lf.path) // #nosec G304 -- path is validated and contained under streams
 	if errors.Is(err, fs.ErrNotExist) {
 		return 0, nil
 	}
@@ -404,7 +426,7 @@ func (s *ledgerStore) Delete(ctx context.Context, name string) (err error) {
 	lf.mu.Lock()
 	defer lf.mu.Unlock()
 
-	f, oerr := os.OpenFile(lf.path, os.O_RDWR, 0)
+	f, oerr := os.OpenFile(lf.path, os.O_RDWR, 0) // #nosec G304 -- lf.path is validated and contained under streams
 	switch {
 	case oerr == nil:
 		if lerr := lockFileEx(f); lerr != nil {
@@ -465,19 +487,23 @@ func scanFrames(data []byte, path string) (lastSeq uint64, goodEnd int64, err er
 }
 
 // fsyncDir opens dir and fsyncs it so a newly created child file's directory
-// entry is durable across a crash.
-func fsyncDir(dir string) (err error) {
-	d, oerr := os.Open(dir)
+// entry is durable across a crash. It wraps any fault via ioErr so the caller's
+// own backend-typed error surfaces (a KV/Blob Put's dir fsync must not report a
+// ledger error), mirroring how writeFileAtomic already takes an ioErrFunc.
+func fsyncDir(dir string, ioErr ioErrFunc) (err error) {
+	// dir derives from a ValidateName-checked, containment-verified path (pathFor),
+	// so it cannot escape the store root.
+	d, oerr := os.Open(dir) // #nosec G304 -- dir derives from a validated, containment-checked store path
 	if oerr != nil {
-		return &LedgerIOError{Op: "open-dir", Path: dir, Cause: oerr}
+		return ioErr("open-dir", dir, oerr)
 	}
 	defer func() {
 		if cerr := d.Close(); cerr != nil && err == nil {
-			err = &LedgerIOError{Op: "close-dir", Path: dir, Cause: cerr}
+			err = ioErr("close-dir", dir, cerr)
 		}
 	}()
 	if serr := d.Sync(); serr != nil {
-		return &LedgerIOError{Op: "fsync-dir", Path: dir, Cause: serr}
+		return ioErr("fsync-dir", dir, serr)
 	}
 	return nil
 }
@@ -487,10 +513,11 @@ func fsyncDir(dir string) (err error) {
 // span several levels (e.g. a new streams/sessions holding the .log file) — are
 // all durable across a crash. leafDir is always stopDir or a descendant of it (it
 // derives from a path contained under stopDir), so the walk terminates at stopDir;
-// the filesystem-root guard is defensive belt-and-braces only.
-func fsyncDirChain(leafDir, stopDir string) error {
+// the filesystem-root guard is defensive belt-and-braces only. ioErr threads the
+// caller's backend-typed IO error down to each per-directory fsync.
+func fsyncDirChain(leafDir, stopDir string, ioErr ioErrFunc) error {
 	for dir := leafDir; ; {
-		if err := fsyncDir(dir); err != nil {
+		if err := fsyncDir(dir, ioErr); err != nil {
 			return err
 		}
 		if dir == stopDir {

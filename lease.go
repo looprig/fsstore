@@ -192,7 +192,7 @@ func (s *leaserStore) Acquire(ctx context.Context, name string) (storekit.Lease,
 		return nil, &LeaseIOError{Op: "mkdir", Path: dir, Cause: err}
 	}
 
-	f, oerr := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	f, oerr := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600) // #nosec G304 -- path is validated and contained under leases
 	if oerr != nil {
 		return nil, &LeaseIOError{Op: "open", Path: path, Cause: oerr}
 	}

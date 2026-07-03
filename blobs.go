@@ -164,7 +164,7 @@ func (s *blobStore) Put(ctx context.Context, key string, r io.Reader) error {
 	m.Lock()
 	defer m.Unlock()
 
-	existing, err := os.ReadFile(path) //nolint:gosec // path is validated and contained under blobs
+	existing, err := os.ReadFile(path) // #nosec G304 -- path is validated and contained under blobs
 	switch {
 	case err == nil:
 		if bytes.Equal(existing, data) {
@@ -186,7 +186,7 @@ func (s *blobStore) Put(ctx context.Context, key string, r io.Reader) error {
 	}
 	// A new blob may have created intermediate directories (e.g. blobs/snaps), so
 	// fsync the ancestor chain up to blobs to make the new dirents crash-durable.
-	if err := fsyncDirChain(dir, s.blobs); err != nil {
+	if err := fsyncDirChain(dir, s.blobs, blobIOErr); err != nil {
 		return err
 	}
 	return nil
@@ -205,7 +205,7 @@ func (s *blobStore) Get(ctx context.Context, key string) (io.ReadCloser, error) 
 	if perr != nil {
 		return nil, perr
 	}
-	f, err := os.Open(path) //nolint:gosec // path is validated and contained under blobs
+	f, err := os.Open(path) // #nosec G304 -- path is validated and contained under blobs
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, &storekit.BlobNotFoundError{Key: key}
 	}

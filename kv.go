@@ -183,7 +183,7 @@ func (s *kvStore) Get(ctx context.Context, key string) ([]byte, uint64, error) {
 		return nil, 0, perr
 	}
 
-	data, err := os.ReadFile(path) //nolint:gosec // path is validated and contained under kv
+	data, err := os.ReadFile(path) // #nosec G304 -- path is validated and contained under kv
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, 0, &storekit.KeyNotFoundError{Key: key}
 	}
@@ -244,10 +244,10 @@ func (s *kvStore) Put(ctx context.Context, key string, expectedRev uint64, val [
 	// so on create fsync the ancestor chain up to kv; an overwrite only needs the
 	// immediate parent (the target dirent) made durable.
 	if !exists {
-		if err := fsyncDirChain(dir, s.kv); err != nil {
+		if err := fsyncDirChain(dir, s.kv, kvIOErr); err != nil {
 			return 0, err
 		}
-	} else if err := fsyncDir(dir); err != nil {
+	} else if err := fsyncDir(dir, kvIOErr); err != nil {
 		return 0, err
 	}
 	return newRev, nil
@@ -301,7 +301,7 @@ func (s *kvStore) Delete(ctx context.Context, key string) error {
 // CLOSED on a present-but-truncated file. An absent file is the legitimate "no
 // revision yet" state and yields (0, false, nil).
 func readRev(path string) (rev uint64, exists bool, err error) {
-	f, oerr := os.Open(path) //nolint:gosec // path is validated and contained under kv
+	f, oerr := os.Open(path) // #nosec G304 -- path is validated and contained under kv
 	if errors.Is(oerr, fs.ErrNotExist) {
 		return 0, false, nil
 	}
