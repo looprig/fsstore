@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ciram-co/storekit"
+	"github.com/looprig/storekit"
 )
 
 // blobFilePath returns the on-disk path the Blobs backend maps key to, so a test

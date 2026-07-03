@@ -3,8 +3,8 @@ package fsstore
 import (
 	"testing"
 
-	"github.com/ciram-co/storekit"
-	"github.com/ciram-co/storekit/storetest"
+	"github.com/looprig/storekit"
+	"github.com/looprig/storekit/storetest"
 )
 
 // TestLedgerConformance runs the shared storekit ledger conformance suite against
