@@ -21,6 +21,20 @@ func TestLedgerConformance(t *testing.T) {
 	})
 }
 
+// TestKVConformance runs the shared storekit KV conformance suite against the
+// filesystem KV backend. A fresh newKVStore over a per-call t.TempDir yields a
+// fresh, empty key space, so every suite subtest is fully independent.
+func TestKVConformance(t *testing.T) {
+	t.Parallel()
+	storetest.TestKV(t, func(t *testing.T) storekit.KV {
+		s, err := newKVStore(t.TempDir())
+		if err != nil {
+			t.Fatalf("newKVStore: %v", err)
+		}
+		return s
+	})
+}
+
 // TestLeaserConformance runs the shared storekit leaser conformance suite against
 // the filesystem leaser backend. A fresh newLeaserStore over a per-call t.TempDir
 // yields a fresh, empty lease slot per name, so every suite subtest is independent.
