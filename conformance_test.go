@@ -20,3 +20,20 @@ func TestLedgerConformance(t *testing.T) {
 		return s
 	})
 }
+
+// TestLeaserConformance runs the shared storekit leaser conformance suite against
+// the filesystem leaser backend. A fresh newLeaserStore over a per-call t.TempDir
+// yields a fresh, empty lease slot per name, so every suite subtest is independent.
+// The held->LeaseHeldError case works in-process because flock binds to the open
+// file description: a second Acquire opens a FRESH fd, whose non-blocking LOCK_EX
+// conflicts with the first even within this one process.
+func TestLeaserConformance(t *testing.T) {
+	t.Parallel()
+	storetest.TestLeaser(t, func(t *testing.T) storekit.Leaser {
+		s, err := newLeaserStore(t.TempDir())
+		if err != nil {
+			t.Fatalf("newLeaserStore: %v", err)
+		}
+		return s
+	})
+}

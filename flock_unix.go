@@ -3,6 +3,7 @@
 package fsstore
 
 import (
+	"errors"
 	"os"
 	"syscall"
 )
@@ -16,6 +17,28 @@ func lockFileEx(f *os.File) error {
 		return &FlockError{Op: "lock", Path: f.Name(), Cause: err}
 	}
 	return nil
+}
+
+// tryLockFileEx attempts a NON-BLOCKING exclusive (LOCK_EX|LOCK_NB) advisory lock
+// on f. It reports a tri-state, distinguishing "held elsewhere" from a real fault:
+//   - (true, nil)  — the lock was granted.
+//   - (false, nil) — the lock is already held on another open file description
+//     (EWOULDBLOCK). This is an expected outcome (the Leaser maps it to
+//     *LeaseHeldError), not a failure.
+//   - (false, *FlockError) — a genuine syscall fault.
+//
+// Like lockFileEx, the lock binds to the open file description, so it is released
+// by unlockFile, by closing f, or automatically when the process exits — a crashed
+// holder's lock is reclaimed by the kernel with no stale-lock cleanup required.
+func tryLockFileEx(f *os.File) (acquired bool, err error) {
+	lerr := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if lerr == nil {
+		return true, nil
+	}
+	if errors.Is(lerr, syscall.EWOULDBLOCK) {
+		return false, nil
+	}
+	return false, &FlockError{Op: "trylock", Path: f.Name(), Cause: lerr}
 }
 
 // unlockFile releases the advisory lock held on f (LOCK_UN).
