@@ -3,8 +3,8 @@ package fsstore
 import (
 	"testing"
 
-	"github.com/looprig/storekit"
-	"github.com/looprig/storekit/storetest"
+	"github.com/looprig/storage"
+	"github.com/looprig/storage/storetest"
 )
 
 // TestLedgerConformance runs the shared storekit ledger conformance suite against

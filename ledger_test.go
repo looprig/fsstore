@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/looprig/storekit"
+	"github.com/looprig/storage"
 )
 
 // ledgerFilePath returns the on-disk path the ledger backend maps name to, so a

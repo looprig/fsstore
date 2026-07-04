@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/looprig/storekit"
+	"github.com/looprig/storage"
 )
 
 // TestOpenRootValidation covers Open's Root handling: an empty Root is rejected

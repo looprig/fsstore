@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/looprig/storekit"
+	"github.com/looprig/storage"
 )
 
 // kvFilePath returns the on-disk path the KV backend maps key to, so a test can

@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/looprig/storekit"
+	"github.com/looprig/storage"
 )
 
 // leaseLockPath returns the on-disk path the leaser maps name to, so a test can
