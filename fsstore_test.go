@@ -130,6 +130,55 @@ func TestOpenLaysOutBackends(t *testing.T) {
 	}
 }
 
+// TestStoragePaths proves the store and each primitive expose the same canonical
+// provider root through the optional storage.PathReporter capability. Every call
+// must allocate its own result so a caller cannot mutate later observations.
+func TestStoragePaths(t *testing.T) {
+	t.Parallel()
+
+	base := t.TempDir()
+	root := filepath.Join(base, "missing", "..", "store")
+	s, err := Open(Options{Root: root})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	want, err := filepath.EvalSymlinks(filepath.Join(base, "store"))
+	if err != nil {
+		t.Fatalf("EvalSymlinks(store root): %v", err)
+	}
+	t.Cleanup(func() {
+		if cerr := s.Close(); cerr != nil {
+			t.Errorf("Close: %v", cerr)
+		}
+	})
+
+	tests := []struct {
+		name     string
+		reporter storage.PathReporter
+	}{
+		{name: "store", reporter: s},
+		{name: "ledger", reporter: s.Ledger.(storage.PathReporter)},
+		{name: "leaser", reporter: s.Leaser.(storage.PathReporter)},
+		{name: "kv", reporter: s.KV.(storage.PathReporter)},
+		{name: "blobs", reporter: s.Blobs.(storage.PathReporter)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := tt.reporter.StoragePaths()
+			if len(got) != 1 || got[0] != want {
+				t.Fatalf("StoragePaths() = %v, want [%q]", got, want)
+			}
+			got[0] = filepath.Join(base, "mutated")
+			if next := tt.reporter.StoragePaths(); len(next) != 1 || next[0] != want {
+				t.Errorf("StoragePaths() after caller mutation = %v, want [%q]", next, want)
+			}
+		})
+	}
+}
+
 // TestStoreRoundTrip exercises all four primitives through the assembled Store: a
 // ledger append+read, a lease acquire+release, a KV put+get, and a blob put+get,
 // each reached as a promoted field on the embedded Composite.

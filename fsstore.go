@@ -67,6 +67,7 @@ func (e *OptionsError) Unwrap() error { return e.Cause }
 // file-level comment); embedding the field-bundle is how Store sidesteps that.
 type Store struct {
 	*storage.Composite
+	root string
 
 	// ledger is retained as its concrete type solely so Close can release the
 	// backend's in-process state (its cached name->file registry). The other three
@@ -92,6 +93,10 @@ func Open(opts Options) (*Store, error) {
 		return nil, &OptionsError{Field: "Root", Reason: "must not be empty"}
 	}
 	root := filepath.Clean(opts.Root)
+	root, err := filepath.Abs(root)
+	if err != nil {
+		return nil, &OptionsError{Field: "Root", Reason: "resolve absolute store root", Cause: err}
+	}
 	switch info, serr := os.Stat(root); {
 	case serr == nil:
 		// Root already exists: it must be a directory to hold the backend layout.
@@ -105,6 +110,10 @@ func Open(opts Options) (*Store, error) {
 		}
 	default:
 		return nil, &OptionsError{Field: "Root", Reason: "stat store root", Cause: serr}
+	}
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		return nil, &OptionsError{Field: "Root", Reason: "resolve store root symlinks", Cause: err}
 	}
 
 	ledger, err := newLedgerStore(root)
@@ -128,13 +137,27 @@ func Open(opts Options) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Store{Composite: composite, ledger: ledger}, nil
+	return &Store{Composite: composite, root: root, ledger: ledger}, nil
 }
 
 // Backend returns the assembled four-primitive bundle to hand to a consumer such
 // as sessionstore.Open. It is the embedded *storage.Composite; callers may read
 // store.Composite directly instead.
 func (s *Store) Backend() *storage.Composite { return s.Composite }
+
+// StoragePaths reports the canonical local root that contains every primitive.
+// The result is newly allocated so callers cannot mutate subsequent reports.
+func (s *Store) StoragePaths() []string { return providerPaths(s.root) }
+
+func (s *ledgerStore) StoragePaths() []string { return providerPaths(s.root) }
+
+func (s *leaserStore) StoragePaths() []string { return providerPaths(s.root) }
+
+func (s *kvStore) StoragePaths() []string { return providerPaths(s.root) }
+
+func (s *blobStore) StoragePaths() []string { return providerPaths(s.root) }
+
+func providerPaths(root string) []string { return []string{root} }
 
 // Close releases the store's in-process state. Concretely it drops the ledger
 // backend's cached name->file registry (the tip/size metadata retained after the
