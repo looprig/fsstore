@@ -136,13 +136,17 @@ func TestOpenLaysOutBackends(t *testing.T) {
 func TestStoragePaths(t *testing.T) {
 	t.Parallel()
 
+	target := t.TempDir()
 	base := t.TempDir()
-	root := filepath.Join(base, "missing", "..", "store")
+	root := filepath.Join(base, "store-alias")
+	if err := os.Symlink(target, root); err != nil {
+		t.Fatalf("Symlink(%q, %q): %v", target, root, err)
+	}
 	s, err := Open(Options{Root: root})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	want, err := filepath.EvalSymlinks(filepath.Join(base, "store"))
+	want, err := filepath.EvalSymlinks(target)
 	if err != nil {
 		t.Fatalf("EvalSymlinks(store root): %v", err)
 	}
@@ -350,8 +354,13 @@ func TestOpenComposesConcreteBackends(t *testing.T) {
 // (Per-backend assertions also live beside each implementation; these gather them
 // at the composition root so a break surfaces here too.)
 var (
-	_ storage.Ledger = (*ledgerStore)(nil)
-	_ storage.Leaser = (*leaserStore)(nil)
-	_ storage.KV     = (*kvStore)(nil)
-	_ storage.Blobs  = (*blobStore)(nil)
+	_ storage.Ledger       = (*ledgerStore)(nil)
+	_ storage.Leaser       = (*leaserStore)(nil)
+	_ storage.KV           = (*kvStore)(nil)
+	_ storage.Blobs        = (*blobStore)(nil)
+	_ storage.PathReporter = (*Store)(nil)
+	_ storage.PathReporter = (*ledgerStore)(nil)
+	_ storage.PathReporter = (*leaserStore)(nil)
+	_ storage.PathReporter = (*kvStore)(nil)
+	_ storage.PathReporter = (*blobStore)(nil)
 )
