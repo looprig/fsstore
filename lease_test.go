@@ -112,7 +112,7 @@ func TestLeaseHeldReportsPersistedEpoch(t *testing.T) {
 	t.Cleanup(func() { _ = first.Release(ctx) })
 
 	_, err = s.Acquire(ctx, name)
-	var held *storekit.LeaseHeldError
+	var held *storage.LeaseHeldError
 	if !errors.As(err, &held) {
 		t.Fatalf("second Acquire = %v, want *LeaseHeldError", err)
 	}

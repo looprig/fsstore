@@ -14,7 +14,7 @@ import (
 	"github.com/looprig/storage"
 )
 
-// This file implements storekit.Ledger over the local filesystem: one append-only
+// This file implements storage.Ledger over the local filesystem: one append-only
 // file per named ledger, laid out as <root>/streams/<name>.log where the name's
 // '/'-separated segments become directory components. Each record is an
 // encodeFrame frame (see frame.go); the file is the concatenation of its frames.
@@ -49,7 +49,7 @@ import (
 // loss.) The append-only invariant also means a snapshot stays valid for the life
 // of the cursor.
 //
-// ctx is accepted to satisfy the storekit.Ledger contract but, like the memstore
+// ctx is accepted to satisfy the storage.Ledger contract but, like the memstore
 // reference backend, local filesystem syscalls are not interrupted mid-call.
 
 // logExt is the on-disk suffix appended to every ledger file's mapped path.
@@ -128,7 +128,7 @@ type ledgerStore struct {
 }
 
 // Compile-time proof that *ledgerStore honors the Ledger contract.
-var _ storekit.Ledger = (*ledgerStore)(nil)
+var _ storage.Ledger = (*ledgerStore)(nil)
 
 // ledgerFile holds the per-name serialization mutex and the cached tip observed
 // after the last write. tip/size are authoritative only while recovered is true
@@ -184,7 +184,7 @@ func ledgerIOErr(op, path string, cause error) error {
 	return &LedgerIOError{Op: op, Path: path, Cause: cause}
 }
 
-// pathFor maps a storekit name to its ledger file path under streams and verifies
+// pathFor maps a storage name to its ledger file path under streams and verifies
 // the result stays within streams (containment / defense in depth). The name's
 // '/'-separated segments become path components; the file gains the .log suffix.
 // Containment is LEXICAL: it assumes an exclusively-owned root created at 0700 and
@@ -227,7 +227,7 @@ func (s *ledgerStore) fileFor(name string) (*ledgerFile, error) {
 // streams) before advancing the cached tip. A CAS mismatch returns *ConflictError
 // with state untouched; a filesystem backend never returns *AmbiguousError.
 func (s *ledgerStore) Append(ctx context.Context, name string, expected uint64, payload []byte) (err error) {
-	if verr := storekit.ValidateName(name); verr != nil {
+	if verr := storage.ValidateName(name); verr != nil {
 		return verr
 	}
 	lf, ferr := s.fileFor(name)
@@ -275,7 +275,7 @@ func (s *ledgerStore) Append(ctx context.Context, name string, expected uint64, 
 	// lands here, making the dir fsync redundant — a negligible cost.
 	created := lf.size == 0
 	if expected != lf.tip {
-		return &storekit.ConflictError{Name: name, Expected: expected}
+		return &storage.ConflictError{Name: name, Expected: expected}
 	}
 
 	frame, eerr := encodeFrame(lf.tip+1, payload)
@@ -352,8 +352,8 @@ func (lf *ledgerFile) refresh(f *os.File) error {
 // to later appends, truncations, or deletion. from < 1 clamps to the first
 // record; from > tip and an absent ledger both yield an immediately-drained
 // cursor. A corrupt file fails closed.
-func (s *ledgerStore) Read(ctx context.Context, name string, from uint64) (storekit.Cursor, error) {
-	if err := storekit.ValidateName(name); err != nil {
+func (s *ledgerStore) Read(ctx context.Context, name string, from uint64) (storage.Cursor, error) {
+	if err := storage.ValidateName(name); err != nil {
 		return nil, err
 	}
 	lf, ferr := s.fileFor(name)
@@ -387,7 +387,7 @@ func (s *ledgerStore) Read(ctx context.Context, name string, from uint64) (store
 // file read-only, so a torn tail is reported as the last good sequence without
 // mutating the file; a corrupt file fails closed.
 func (s *ledgerStore) Tip(ctx context.Context, name string) (uint64, error) {
-	if err := storekit.ValidateName(name); err != nil {
+	if err := storage.ValidateName(name); err != nil {
 		return 0, err
 	}
 	lf, ferr := s.fileFor(name)
@@ -416,7 +416,7 @@ func (s *ledgerStore) Tip(ctx context.Context, name string) (uint64, error) {
 // completes first, then resets the in-process cache so a later Append re-creates
 // the ledger from empty.
 func (s *ledgerStore) Delete(ctx context.Context, name string) (err error) {
-	if verr := storekit.ValidateName(name); verr != nil {
+	if verr := storage.ValidateName(name); verr != nil {
 		return verr
 	}
 	lf, ferr := s.fileFor(name)
@@ -535,8 +535,8 @@ func fsyncDirChain(leafDir, stopDir string, ioErr ioErrFunc) error {
 // beyond the tip: it yields io.EOF immediately.
 type drainedCursor struct{}
 
-func (drainedCursor) Next(ctx context.Context) (storekit.Record, error) {
-	return storekit.Record{}, io.EOF
+func (drainedCursor) Next(ctx context.Context) (storage.Record, error) {
+	return storage.Record{}, io.EOF
 }
 
 func (drainedCursor) Close() error { return nil }
@@ -557,25 +557,25 @@ type recordCursor struct {
 // Next decodes and returns the next record with sequence in [from, tip], handing
 // back the fresh payload copy that decodeFrame produced, or io.EOF once the
 // snapshot's tip has been reached.
-func (c *recordCursor) Next(ctx context.Context) (storekit.Record, error) {
+func (c *recordCursor) Next(ctx context.Context) (storage.Record, error) {
 	for c.nextSeq <= c.tip {
 		seq, payload, n, derr := decodeFrame(c.data[c.off:])
 		if derr != nil {
 			// The snapshot was validated up to tip at Read time, so a fault here
 			// means the committed region is unreadable: fail closed.
-			return storekit.Record{}, &LedgerCorruptError{Path: c.path, Seq: c.nextSeq, Cause: derr}
+			return storage.Record{}, &LedgerCorruptError{Path: c.path, Seq: c.nextSeq, Cause: derr}
 		}
 		if seq != c.nextSeq {
-			return storekit.Record{}, &LedgerCorruptError{Path: c.path, Seq: seq, Cause: errNonContiguousSeq}
+			return storage.Record{}, &LedgerCorruptError{Path: c.path, Seq: seq, Cause: errNonContiguousSeq}
 		}
 		c.off += n
 		cur := c.nextSeq
 		c.nextSeq++
 		if cur >= c.from {
-			return storekit.Record{Seq: seq, Payload: payload}, nil
+			return storage.Record{Seq: seq, Payload: payload}, nil
 		}
 	}
-	return storekit.Record{}, io.EOF
+	return storage.Record{}, io.EOF
 }
 
 // Close releases the cursor. The snapshot is an in-memory copy, so there is

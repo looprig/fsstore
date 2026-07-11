@@ -17,7 +17,7 @@ import (
 // typed IO error, which each injects via an ioErrFunc.
 
 // fsTmpPrefix marks a temp file staged for an atomic rename. It starts with a '.',
-// which the storekit name grammar forbids as a segment's first byte, so a temp
+// which the storage name grammar forbids as a segment's first byte, so a temp
 // file can never collide with a committed key and is always skipped by walkKeys —
 // a concurrent listing therefore never surfaces a half-written value as a key.
 const fsTmpPrefix = ".fsstore-tmp-"

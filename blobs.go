@@ -15,7 +15,7 @@ import (
 	"github.com/looprig/storage"
 )
 
-// This file implements storekit.Blobs over the local filesystem: one file per key,
+// This file implements storage.Blobs over the local filesystem: one file per key,
 // laid out as <root>/blobs/<key> where the key's '/'-separated segments become
 // directory components. A blob file holds the raw bytes verbatim — no header — so
 // Get streams the object directly.
@@ -36,7 +36,7 @@ import (
 // absent key is reported, a present one opened — the atomic-rename write path means
 // a reader never observes a partial object).
 //
-// ctx is accepted to satisfy the storekit.Blobs contract but, like the memstore
+// ctx is accepted to satisfy the storage.Blobs contract but, like the memstore
 // reference backend, local filesystem syscalls are not interrupted mid-call.
 
 // BlobRootError reports that newBlobStore was given an unusable root (for example,
@@ -91,7 +91,7 @@ type blobStore struct {
 }
 
 // Compile-time proof that *blobStore honors the Blobs contract.
-var _ storekit.Blobs = (*blobStore)(nil)
+var _ storage.Blobs = (*blobStore)(nil)
 
 // newBlobStore creates <root> and <root>/blobs at 0700 and returns a Blobs backend
 // rooted there. It rejects an empty root and wraps any mkdir failure in a typed
@@ -111,7 +111,7 @@ func newBlobStore(root string) (*blobStore, error) {
 	return &blobStore{root: clean, blobs: blobs, keys: make(map[string]*sync.Mutex)}, nil
 }
 
-// pathFor maps a storekit key to its file path under blobs and verifies the result
+// pathFor maps a storage key to its file path under blobs and verifies the result
 // stays within blobs (containment / defense in depth). The key's '/'-separated
 // segments become path components. Containment is LEXICAL: it assumes an
 // exclusively-owned root created at 0700 and does NOT resolve symlinks. Owning the
@@ -148,7 +148,7 @@ func (s *blobStore) lockFor(key string) *sync.Mutex {
 // content is a no-op success; a key holding different content yields a
 // *BlobConflictError with the original object unchanged.
 func (s *blobStore) Put(ctx context.Context, key string, r io.Reader) error {
-	if err := storekit.ValidateName(key); err != nil {
+	if err := storage.ValidateName(key); err != nil {
 		return err
 	}
 	path, perr := s.pathFor(key)
@@ -170,7 +170,7 @@ func (s *blobStore) Put(ctx context.Context, key string, r io.Reader) error {
 		if bytes.Equal(existing, data) {
 			return nil // byte-identical: content-addressed no-op, file left as-is
 		}
-		return &storekit.BlobConflictError{Key: key} // different: original unchanged
+		return &storage.BlobConflictError{Key: key} // different: original unchanged
 	case errors.Is(err, fs.ErrNotExist):
 		// Absent: fall through to the write path.
 	default:
@@ -198,7 +198,7 @@ func (s *blobStore) Put(ctx context.Context, key string, r io.Reader) error {
 // does not affect another. Get takes no lock: the atomic-rename write path means an
 // opened file is always a whole committed object.
 func (s *blobStore) Get(ctx context.Context, key string) (io.ReadCloser, error) {
-	if err := storekit.ValidateName(key); err != nil {
+	if err := storage.ValidateName(key); err != nil {
 		return nil, err
 	}
 	path, perr := s.pathFor(key)
@@ -207,7 +207,7 @@ func (s *blobStore) Get(ctx context.Context, key string) (io.ReadCloser, error) 
 	}
 	f, err := os.Open(path) // #nosec G304 -- path is validated and contained under blobs
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil, &storekit.BlobNotFoundError{Key: key}
+		return nil, &storage.BlobNotFoundError{Key: key}
 	}
 	if err != nil {
 		return nil, &BlobIOError{Op: "open", Path: path, Cause: err}
@@ -220,7 +220,7 @@ func (s *blobStore) Get(ctx context.Context, key string) (io.ReadCloser, error) 
 // Delete the key is free: a fresh Put of any content stores it with no lingering
 // conflict against the removed bytes.
 func (s *blobStore) Delete(ctx context.Context, key string) error {
-	if err := storekit.ValidateName(key); err != nil {
+	if err := storage.ValidateName(key); err != nil {
 		return err
 	}
 	path, perr := s.pathFor(key)

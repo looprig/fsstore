@@ -15,7 +15,7 @@ import (
 	"github.com/looprig/storage"
 )
 
-// This file implements storekit.KV over the local filesystem: one file per key,
+// This file implements storage.KV over the local filesystem: one file per key,
 // laid out as <root>/kv/<key> where the key's '/'-separated segments become
 // directory components. Each file is a small fixed rev header (the uint64 revision,
 // little-endian) followed by the raw value bytes:
@@ -41,7 +41,7 @@ import (
 // one — never a partial write. Reads (Get, Keys) therefore take no lock: atomic
 // rename is their consistency guarantee.
 //
-// ctx is accepted to satisfy the storekit.KV contract but, like the memstore
+// ctx is accepted to satisfy the storage.KV contract but, like the memstore
 // reference backend, local filesystem syscalls are not interrupted mid-call.
 
 // revHeaderSize is the fixed on-disk width, in bytes, of a KV file's revision
@@ -120,7 +120,7 @@ type kvStore struct {
 }
 
 // Compile-time proof that *kvStore honors the KV contract.
-var _ storekit.KV = (*kvStore)(nil)
+var _ storage.KV = (*kvStore)(nil)
 
 // newKVStore creates <root> and <root>/kv at 0700 and returns a KV backend rooted
 // there. It rejects an empty root and wraps any mkdir failure in a typed error.
@@ -139,7 +139,7 @@ func newKVStore(root string) (*kvStore, error) {
 	return &kvStore{root: clean, kv: kv, keys: make(map[string]*sync.Mutex)}, nil
 }
 
-// pathFor maps a storekit key to its file path under kv and verifies the result
+// pathFor maps a storage key to its file path under kv and verifies the result
 // stays within kv (containment / defense in depth). The key's '/'-separated
 // segments become path components. Containment is LEXICAL: it assumes an
 // exclusively-owned root created at 0700 and does NOT resolve symlinks. Owning the
@@ -175,7 +175,7 @@ func (s *kvStore) lockFor(key string) *sync.Mutex {
 // mutex: an atomic rename means it observes either the whole old file or the whole
 // new one, never a partial write. The returned slice is a fresh copy.
 func (s *kvStore) Get(ctx context.Context, key string) ([]byte, uint64, error) {
-	if err := storekit.ValidateName(key); err != nil {
+	if err := storage.ValidateName(key); err != nil {
 		return nil, 0, err
 	}
 	path, perr := s.pathFor(key)
@@ -185,7 +185,7 @@ func (s *kvStore) Get(ctx context.Context, key string) ([]byte, uint64, error) {
 
 	data, err := os.ReadFile(path) // #nosec G304 -- path is validated and contained under kv
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil, 0, &storekit.KeyNotFoundError{Key: key}
+		return nil, 0, &storage.KeyNotFoundError{Key: key}
 	}
 	if err != nil {
 		return nil, 0, &KVIOError{Op: "read", Path: path, Cause: err}
@@ -208,7 +208,7 @@ func (s *kvStore) Get(ctx context.Context, key string) ([]byte, uint64, error) {
 // it, atomically renames it over the target, fsyncs the parent directory, and
 // returns the new revision.
 func (s *kvStore) Put(ctx context.Context, key string, expectedRev uint64, val []byte) (uint64, error) {
-	if err := storekit.ValidateName(key); err != nil {
+	if err := storage.ValidateName(key); err != nil {
 		return 0, err
 	}
 	path, perr := s.pathFor(key)
@@ -225,7 +225,7 @@ func (s *kvStore) Put(ctx context.Context, key string, expectedRev uint64, val [
 		return 0, rerr
 	}
 	if expectedRev != cur {
-		return 0, &storekit.ConflictError{Name: key, Expected: expectedRev}
+		return 0, &storage.ConflictError{Name: key, Expected: expectedRev}
 	}
 	newRev := cur + 1
 
@@ -279,7 +279,7 @@ func kvIOErr(op, path string, cause error) error {
 // Delete the key is absent (Get reports *KeyNotFoundError) and its revision counter
 // is forgotten (a re-created key restarts at rev 1).
 func (s *kvStore) Delete(ctx context.Context, key string) error {
-	if err := storekit.ValidateName(key); err != nil {
+	if err := storage.ValidateName(key); err != nil {
 		return err
 	}
 	path, perr := s.pathFor(key)

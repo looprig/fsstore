@@ -21,7 +21,7 @@ const (
 	// frameHeaderSize is the fixed on-disk header width: len(4)+crc(4)+seq(8).
 	frameHeaderSize = 16
 
-	// MaxFramePayload caps a single frame's payload at 16 MiB. storekit only
+	// MaxFramePayload caps a single frame's payload at 16 MiB. storage only
 	// requires backends to accept 1 MiB payloads; the 16 MiB ceiling is
 	// deliberate headroom. It also bounds the allocation a decoder performs for
 	// any declared length: a larger declared length is rejected as corruption

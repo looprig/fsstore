@@ -19,7 +19,7 @@ func ledgerFilePath(root, name string) string {
 }
 
 // readAllRecords drains a cursor to exhaustion on the calling goroutine.
-func readAllRecords(t *testing.T, l storekit.Ledger, name string, from uint64) []storekit.Record {
+func readAllRecords(t *testing.T, l storage.Ledger, name string, from uint64) []storage.Record {
 	t.Helper()
 	ctx := context.Background()
 	cur, err := l.Read(ctx, name, from)
@@ -31,7 +31,7 @@ func readAllRecords(t *testing.T, l storekit.Ledger, name string, from uint64) [
 			t.Errorf("cursor Close: %v", cerr)
 		}
 	}()
-	var out []storekit.Record
+	var out []storage.Record
 	for {
 		rec, nerr := cur.Next(ctx)
 		if errors.Is(nerr, io.EOF) {
@@ -104,7 +104,7 @@ func TestLedgerTornTailRecovery(t *testing.T) {
 			if err := s2.Append(ctx, name, 3, []byte("stale")); err == nil {
 				t.Errorf("Append(expected=3) after recovery = nil, want *ConflictError")
 			} else {
-				var ce *storekit.ConflictError
+				var ce *storage.ConflictError
 				if !errors.As(err, &ce) {
 					t.Errorf("Append(expected=3) = %v, want *ConflictError", err)
 				}
@@ -268,11 +268,11 @@ func TestLedgerCorruptFailsClosed(t *testing.T) {
 	}
 	ops := []struct {
 		label string
-		call  func(l storekit.Ledger) error
+		call  func(l storage.Ledger) error
 	}{
-		{"Tip", func(l storekit.Ledger) error { _, err := l.Tip(ctx, name); return err }},
-		{"Read", func(l storekit.Ledger) error { _, err := l.Read(ctx, name, 1); return err }},
-		{"Append", func(l storekit.Ledger) error { return l.Append(ctx, name, 2, []byte("x")) }},
+		{"Tip", func(l storage.Ledger) error { _, err := l.Tip(ctx, name); return err }},
+		{"Read", func(l storage.Ledger) error { _, err := l.Read(ctx, name, 1); return err }},
+		{"Append", func(l storage.Ledger) error { return l.Append(ctx, name, 2, []byte("x")) }},
 	}
 	for _, c := range corruptions {
 		for _, op := range ops {

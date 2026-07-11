@@ -13,7 +13,7 @@ import (
 	"github.com/looprig/storage"
 )
 
-// This file implements storekit.Leaser over the local filesystem: one lock file
+// This file implements storage.Leaser over the local filesystem: one lock file
 // per named lease, laid out as <root>/leases/<name>.lock where the name's
 // '/'-separated segments become directory components.
 //
@@ -44,7 +44,7 @@ import (
 // torn or unparseable read there fails soft to 0 (the epoch is informational, the
 // refusal itself is authoritative).
 //
-// ctx is accepted to satisfy the storekit.Leaser/Lease contract but local
+// ctx is accepted to satisfy the storage.Leaser/Lease contract but local
 // filesystem syscalls are not interrupted mid-call.
 
 // leaseExt is the on-disk suffix appended to every lock file's mapped path.
@@ -129,8 +129,8 @@ type leaserStore struct {
 // Compile-time proof that *leaserStore honors the Leaser contract and *fsLease the
 // Lease contract.
 var (
-	_ storekit.Leaser = (*leaserStore)(nil)
-	_ storekit.Lease  = (*fsLease)(nil)
+	_ storage.Leaser = (*leaserStore)(nil)
+	_ storage.Lease  = (*fsLease)(nil)
 )
 
 // newLeaserStore creates <root> and <root>/leases at 0700 and returns a leaser
@@ -151,7 +151,7 @@ func newLeaserStore(root string) (*leaserStore, error) {
 	return &leaserStore{root: clean, leases: leases}, nil
 }
 
-// pathFor maps a storekit name to its lock file path under leases and verifies the
+// pathFor maps a storage name to its lock file path under leases and verifies the
 // result stays within leases (containment / defense in depth). The name's
 // '/'-separated segments become path components; the file gains the .lock suffix.
 // Containment is LEXICAL: it assumes an exclusively-owned root created at 0700 and
@@ -179,8 +179,8 @@ func (s *leaserStore) pathFor(name string) (string, error) {
 //
 // A filesystem backend never returns *AmbiguousError: a failed acquire is always
 // definite (fail closed, no partial grant).
-func (s *leaserStore) Acquire(ctx context.Context, name string) (storekit.Lease, error) {
-	if err := storekit.ValidateName(name); err != nil {
+func (s *leaserStore) Acquire(ctx context.Context, name string) (storage.Lease, error) {
+	if err := storage.ValidateName(name); err != nil {
 		return nil, err
 	}
 	path, perr := s.pathFor(name)
@@ -212,9 +212,9 @@ func (s *leaserStore) Acquire(ctx context.Context, name string) (storekit.Lease,
 		// observed; a torn/unreadable read fails soft to 0.
 		holder := readHolderEpoch(f)
 		if cerr := f.Close(); cerr != nil {
-			return nil, errors.Join(&storekit.LeaseHeldError{Name: name, HolderEpoch: holder}, &LeaseIOError{Op: "close", Path: path, Cause: cerr})
+			return nil, errors.Join(&storage.LeaseHeldError{Name: name, HolderEpoch: holder}, &LeaseIOError{Op: "close", Path: path, Cause: cerr})
 		}
-		return nil, &storekit.LeaseHeldError{Name: name, HolderEpoch: holder}
+		return nil, &storage.LeaseHeldError{Name: name, HolderEpoch: holder}
 	}
 
 	// Locked. Advance the persisted epoch counter under the lock.

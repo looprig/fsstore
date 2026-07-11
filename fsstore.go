@@ -12,16 +12,16 @@ import (
 )
 
 // This file is fsstore's composition root: it wires the four filesystem backends
-// (ledger, leaser, KV, blobs) under one store root into a single storekit
+// (ledger, leaser, KV, blobs) under one store root into a single storage
 // field-bundle and exposes lifecycle (Open/Close).
 //
 // # Why a field-bundle, not an all-four interface
 //
-// storekit's four primitives collide on method names — each of Ledger, KV, and
+// storage's four primitives collide on method names — each of Ledger, KV, and
 // Blobs has its own Delete, for instance — so NO single Go type can implement all
-// four at once. storekit solves this with Composite, a struct that EMBEDS one
+// four at once. storage solves this with Composite, a struct that EMBEDS one
 // provider per primitive; a caller reaches each as a field (c.Ledger, c.KV, …).
-// Store follows the same shape: it embeds *storekit.Composite rather than
+// Store follows the same shape: it embeds *storage.Composite rather than
 // pretending to satisfy Ledger+Leaser+KV+Blobs itself. A consumer that wants the
 // whole bundle (sessionstore.Open, say) is handed store.Composite (or Backend()).
 
@@ -60,13 +60,13 @@ func (e *OptionsError) Error() string {
 func (e *OptionsError) Unwrap() error { return e.Cause }
 
 // Store is an open fsstore rooted at a single directory on the local filesystem.
-// It embeds *storekit.Composite, so a caller reaches each primitive as a promoted
+// It embeds *storage.Composite, so a caller reaches each primitive as a promoted
 // field — store.Ledger, store.Leaser, store.KV, store.Blobs — and hands the whole
 // bundle to a consumer as store.Composite or via Backend. The four primitives
 // collide on method names, so no single type can implement all four (see the
 // file-level comment); embedding the field-bundle is how Store sidesteps that.
 type Store struct {
-	*storekit.Composite
+	*storage.Composite
 
 	// ledger is retained as its concrete type solely so Close can release the
 	// backend's in-process state (its cached name->file registry). The other three
@@ -77,11 +77,11 @@ type Store struct {
 	closed bool
 }
 
-// Open assembles a filesystem-backed storekit bundle under opts.Root. It requires
+// Open assembles a filesystem-backed storage bundle under opts.Root. It requires
 // a non-empty Root (empty -> *OptionsError), creates it at 0700, and verifies it
 // resolves to a directory. It then wires the four backends under that root —
 // <root>/streams, <root>/leases, <root>/kv, <root>/blobs, each created at 0700 by
-// its constructor — and bundles them with storekit.NewComposite.
+// its constructor — and bundles them with storage.NewComposite.
 //
 // On any backend-construction failure Open returns that backend's typed error and
 // no Store; because every fs backend only creates directories (none holds an open
@@ -124,7 +124,7 @@ func Open(opts Options) (*Store, error) {
 		return nil, err
 	}
 
-	composite, err := storekit.NewComposite(ledger, leaser, kv, blobs)
+	composite, err := storage.NewComposite(ledger, leaser, kv, blobs)
 	if err != nil {
 		return nil, err
 	}
@@ -132,9 +132,9 @@ func Open(opts Options) (*Store, error) {
 }
 
 // Backend returns the assembled four-primitive bundle to hand to a consumer such
-// as sessionstore.Open. It is the embedded *storekit.Composite; callers may read
+// as sessionstore.Open. It is the embedded *storage.Composite; callers may read
 // store.Composite directly instead.
-func (s *Store) Backend() *storekit.Composite { return s.Composite }
+func (s *Store) Backend() *storage.Composite { return s.Composite }
 
 // Close releases the store's in-process state. Concretely it drops the ledger
 // backend's cached name->file registry (the tip/size metadata retained after the

@@ -297,12 +297,12 @@ func TestOpenComposesConcreteBackends(t *testing.T) {
 	}
 }
 
-// Compile-time proof that the four fsstore backends honor their storekit contracts.
+// Compile-time proof that the four fsstore backends honor their storage contracts.
 // (Per-backend assertions also live beside each implementation; these gather them
 // at the composition root so a break surfaces here too.)
 var (
-	_ storekit.Ledger = (*ledgerStore)(nil)
-	_ storekit.Leaser = (*leaserStore)(nil)
-	_ storekit.KV     = (*kvStore)(nil)
-	_ storekit.Blobs  = (*blobStore)(nil)
+	_ storage.Ledger = (*ledgerStore)(nil)
+	_ storage.Leaser = (*leaserStore)(nil)
+	_ storage.KV     = (*kvStore)(nil)
+	_ storage.Blobs  = (*blobStore)(nil)
 )

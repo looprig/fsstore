@@ -1,6 +1,6 @@
 # CLAUDE.md — fsstore
 
-`fsstore` implements storekit's storage primitives (Ledger, Leaser, KV, Blobs) over the
+`fsstore` implements storage's storage primitives (Ledger, Leaser, KV, Blobs) over the
 local filesystem. It is a concrete backend, not a contract module.
 
 ## Dependencies

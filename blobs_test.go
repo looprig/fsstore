@@ -74,7 +74,7 @@ func TestBlobsIdenticalNoOpVsConflict(t *testing.T) {
 			t.Fatalf("Chtimes: %v", err)
 		}
 		err = s.Put(ctx, key, bytes.NewReader([]byte("totally different bytes")))
-		var bc *storekit.BlobConflictError
+		var bc *storage.BlobConflictError
 		if !errors.As(err, &bc) {
 			t.Fatalf("different re-Put = %v, want *BlobConflictError", err)
 		}
@@ -113,7 +113,7 @@ func TestBlobsTempRenameNoPartial(t *testing.T) {
 	if err := s.Put(ctx, key, bytes.NewReader([]byte("original"))); err != nil {
 		t.Fatalf("Put(create): %v", err)
 	}
-	if err := s.Put(ctx, key, bytes.NewReader([]byte("different"))); !errors.As(err, new(*storekit.BlobConflictError)) {
+	if err := s.Put(ctx, key, bytes.NewReader([]byte("different"))); !errors.As(err, new(*storage.BlobConflictError)) {
 		t.Fatalf("Put(conflict) = %v, want *BlobConflictError", err)
 	}
 	dir := filepath.Dir(blobFilePath(root, key))

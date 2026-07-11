@@ -7,12 +7,12 @@ import (
 	"github.com/looprig/storage/storetest"
 )
 
-// TestLedgerConformance runs the shared storekit ledger conformance suite against
+// TestLedgerConformance runs the shared storage ledger conformance suite against
 // the filesystem ledger backend. A fresh newLedgerStore over a per-call t.TempDir
 // yields a fresh, empty ledger, so every suite subtest is fully independent.
 func TestLedgerConformance(t *testing.T) {
 	t.Parallel()
-	storetest.TestLedger(t, func(t *testing.T) storekit.Ledger {
+	storetest.TestLedger(t, func(t *testing.T) storage.Ledger {
 		s, err := newLedgerStore(t.TempDir())
 		if err != nil {
 			t.Fatalf("newLedgerStore: %v", err)
@@ -21,12 +21,12 @@ func TestLedgerConformance(t *testing.T) {
 	})
 }
 
-// TestKVConformance runs the shared storekit KV conformance suite against the
+// TestKVConformance runs the shared storage KV conformance suite against the
 // filesystem KV backend. A fresh newKVStore over a per-call t.TempDir yields a
 // fresh, empty key space, so every suite subtest is fully independent.
 func TestKVConformance(t *testing.T) {
 	t.Parallel()
-	storetest.TestKV(t, func(t *testing.T) storekit.KV {
+	storetest.TestKV(t, func(t *testing.T) storage.KV {
 		s, err := newKVStore(t.TempDir())
 		if err != nil {
 			t.Fatalf("newKVStore: %v", err)
@@ -35,12 +35,12 @@ func TestKVConformance(t *testing.T) {
 	})
 }
 
-// TestBlobsConformance runs the shared storekit Blobs conformance suite against
+// TestBlobsConformance runs the shared storage Blobs conformance suite against
 // the filesystem Blobs backend. A fresh newBlobStore over a per-call t.TempDir
 // yields a fresh, empty key space, so every suite subtest is fully independent.
 func TestBlobsConformance(t *testing.T) {
 	t.Parallel()
-	storetest.TestBlobs(t, func(t *testing.T) storekit.Blobs {
+	storetest.TestBlobs(t, func(t *testing.T) storage.Blobs {
 		s, err := newBlobStore(t.TempDir())
 		if err != nil {
 			t.Fatalf("newBlobStore: %v", err)
@@ -49,7 +49,7 @@ func TestBlobsConformance(t *testing.T) {
 	})
 }
 
-// TestLeaserConformance runs the shared storekit leaser conformance suite against
+// TestLeaserConformance runs the shared storage leaser conformance suite against
 // the filesystem leaser backend. A fresh newLeaserStore over a per-call t.TempDir
 // yields a fresh, empty lease slot per name, so every suite subtest is independent.
 // The held->LeaseHeldError case works in-process because flock binds to the open
@@ -57,7 +57,7 @@ func TestBlobsConformance(t *testing.T) {
 // conflicts with the first even within this one process.
 func TestLeaserConformance(t *testing.T) {
 	t.Parallel()
-	storetest.TestLeaser(t, func(t *testing.T) storekit.Leaser {
+	storetest.TestLeaser(t, func(t *testing.T) storage.Leaser {
 		s, err := newLeaserStore(t.TempDir())
 		if err != nil {
 			t.Fatalf("newLeaserStore: %v", err)

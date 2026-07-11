@@ -1,8 +1,8 @@
 # fsstore
 
-`fsstore` implements storekit's four storage primitives — **Ledger**, **Leaser**, **KV**,
+`fsstore` implements storage's four storage primitives — **Ledger**, **Leaser**, **KV**,
 and **Blobs** — over the local filesystem, giving a durable, single-host backend for session
-and workspace persistence. The concrete on-disk formats live here, behind storekit's neutral
+and workspace persistence. The concrete on-disk formats live here, behind storage's neutral
 contracts: the ledger is an append-only frame log (length-prefixed, CRC-32C-checked frames)
 with automatic torn-tail recovery on reopen; leases are `flock`-fenced lock files carrying a
 durable, strictly-increasing epoch counter; KV is one revision-CAS'd file per key (atomic
@@ -19,7 +19,7 @@ responsibility.
 ## Usage
 
 `Open` wires the four backends under one root directory and returns them bundled as a
-`*storekit.Composite` (the primitives collide on method names, so they are composed as a
+`*storage.Composite` (the primitives collide on method names, so they are composed as a
 field-bundle, not a single all-four type — reach each as `store.Ledger`, `store.Leaser`,
 `store.KV`, `store.Blobs`). Hand the bundle to a consumer such as `sessionstore.Open`:
 

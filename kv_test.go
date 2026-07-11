@@ -118,7 +118,7 @@ func TestKVReopenPersistsRev(t *testing.T) {
 			}
 
 			// A stale-rev Put must conflict against the persisted rev.
-			if _, err := s2.Put(ctx, key, 0, []byte("stale")); !errors.As(err, new(*storekit.ConflictError)) {
+			if _, err := s2.Put(ctx, key, 0, []byte("stale")); !errors.As(err, new(*storage.ConflictError)) {
 				t.Errorf("Put(expectedRev=0) after reopen = %v, want *ConflictError", err)
 			}
 			// The correct rev continues the chain.
@@ -155,7 +155,7 @@ func TestKVTempRenameNoPartial(t *testing.T) {
 		t.Fatalf("Put(update): %v", err)
 	}
 	// A conflicting Put must not stage a lingering temp file.
-	if _, err := s.Put(ctx, key, 0, []byte("nope")); !errors.As(err, new(*storekit.ConflictError)) {
+	if _, err := s.Put(ctx, key, 0, []byte("nope")); !errors.As(err, new(*storage.ConflictError)) {
 		t.Fatalf("Put(conflict) = %v, want *ConflictError", err)
 	}
 
