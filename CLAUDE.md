@@ -8,6 +8,8 @@ local filesystem. It is a concrete backend, not a contract module.
 - **stdlib + `github.com/looprig/storage` only.** No other third-party dependency, ever.
   Do not `go get` anything else. If a task seems to need an external package, the task is
   wrong for this module.
+- `staticcheck`, `gosec`, and `govulncheck` used by `make secure` are PATH-resolved
+  dev-tool binaries, not `go.mod` dependencies — they do not contradict the rule above.
 
 ## Code rules
 
