@@ -2,6 +2,6 @@ module github.com/looprig/fsstore
 
 go 1.25.0
 
-require github.com/looprig/storage v0.2.0
+require github.com/looprig/storage v0.3.0
 
 replace github.com/looprig/storage => ../storage
