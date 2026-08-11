@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "repository": "fsstore",
+  "proofSources": [
+    {
+      "id": "proof-fsstore-durable-composite-example",
+      "type": "go-example",
+      "path": "examples/durable/example_test.go#Example_durableCompositeStore"
+    },
+    {
+      "id": "proof-fsstore-examples-contract-test",
+      "type": "go-test",
+      "path": "examples/contract_test.go#TestDocsExamplesArtifacts"
+    }
+  ],
+  "examples": [
+    {
+      "id": "example-fsstore-durable-composite-store",
+      "ecosystem": "go",
+      "owner": "fsstore",
+      "sourcePath": "examples/durable/example_test.go",
+      "availability": "source-workspace",
+      "versions": {
+        "github.com/looprig/fsstore": "source-workspace"
+      },
+      "offlineCommand": "GOWORK=off go test -race ./...",
+      "assertion": "Deterministic Go example output proves option validation, composite ledger/KV/blob behavior, explicit resource ownership, and durable reads after reopening the same local root.",
+      "workflowPath": ".github/workflows/docs-examples.yml",
+      "jobId": "docs-examples",
+      "cleanup": "The example defers removal of its unique temporary store root after closing all cursors, blob readers, and stores.",
+      "liveGate": null,
+      "proofIds": [
+        "proof-fsstore-durable-composite-example",
+        "proof-fsstore-examples-contract-test"
+      ]
+    }
+  ]
+}
