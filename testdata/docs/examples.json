@@ -3,14 +3,16 @@
   "repository": "fsstore",
   "proofSources": [
     {
-      "id": "proof-fsstore-durable-composite-example",
-      "type": "go-example",
-      "path": "examples/durable/example_test.go#Example_durableCompositeStore"
+      "id": "example-fsstore-durable-composite-store-fixture",
+      "type": "executable-fixture",
+      "path": "examples/durable/example_test.go",
+      "symbol": "Example_durableCompositeStore"
     },
     {
-      "id": "proof-fsstore-examples-contract-test",
-      "type": "go-test",
-      "path": "examples/contract_test.go#TestDocsExamplesArtifacts"
+      "id": "example-fsstore-examples-contract-test",
+      "type": "test",
+      "path": "examples/contract_test.go",
+      "symbol": "TestDocsExamplesArtifacts"
     }
   ],
   "examples": [
@@ -30,8 +32,8 @@
       "cleanup": "The example defers removal of its unique temporary store root after closing all cursors, blob readers, and stores.",
       "liveGate": null,
       "proofIds": [
-        "proof-fsstore-durable-composite-example",
-        "proof-fsstore-examples-contract-test"
+        "example-fsstore-durable-composite-store-fixture",
+        "example-fsstore-examples-contract-test"
       ]
     }
   ]

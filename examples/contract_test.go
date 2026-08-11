@@ -14,9 +14,10 @@ type examplesManifest struct {
 	SchemaVersion int    `json:"schemaVersion"`
 	Repository    string `json:"repository"`
 	ProofSources  []struct {
-		ID   string `json:"id"`
-		Type string `json:"type"`
-		Path string `json:"path"`
+		ID     string `json:"id"`
+		Type   string `json:"type"`
+		Path   string `json:"path"`
+		Symbol string `json:"symbol,omitempty"`
 	} `json:"proofSources"`
 	Examples []struct {
 		ID             string            `json:"id"`
@@ -50,19 +51,43 @@ func TestDocsExamplesArtifacts(t *testing.T) {
 		t.Fatalf("manifest identity = schema %d repository %q", manifest.SchemaVersion, manifest.Repository)
 	}
 
+	expectedProofs := map[string]struct {
+		proofType string
+		path      string
+		symbol    string
+	}{
+		"example-fsstore-durable-composite-store-fixture": {
+			proofType: "executable-fixture",
+			path:      "examples/durable/example_test.go",
+			symbol:    "Example_durableCompositeStore",
+		},
+		"example-fsstore-examples-contract-test": {
+			proofType: "test",
+			path:      "examples/contract_test.go",
+			symbol:    "TestDocsExamplesArtifacts",
+		},
+	}
 	proofs := make(map[string]bool, len(manifest.ProofSources))
 	for _, proof := range manifest.ProofSources {
-		if !strings.HasPrefix(proof.ID, "proof-fsstore-") || proof.Type == "" || proof.Path == "" {
-			t.Errorf("invalid proof source: %#v", proof)
+		expected, ok := expectedProofs[proof.ID]
+		if !ok {
+			t.Errorf("unexpected proof source ID %q", proof.ID)
+		} else if proof.Type != expected.proofType || proof.Path != expected.path || proof.Symbol != expected.symbol {
+			t.Errorf("proof source %q = type %q path %q symbol %q, want type %q path %q symbol %q", proof.ID, proof.Type, proof.Path, proof.Symbol, expected.proofType, expected.path, expected.symbol)
 		}
 		if proofs[proof.ID] {
 			t.Errorf("duplicate proof source ID %q", proof.ID)
 		}
 		proofs[proof.ID] = true
-		path := strings.SplitN(proof.Path, "#", 2)[0]
-		if _, err := os.Stat(filepath.Join(repositoryRoot, path)); err != nil {
+		if strings.Contains(proof.Path, "#") {
+			t.Errorf("proof source %q path contains a symbol fragment: %q", proof.ID, proof.Path)
+		}
+		if _, err := os.Stat(filepath.Join(repositoryRoot, proof.Path)); err != nil {
 			t.Errorf("proof source %q does not resolve locally: %v", proof.ID, err)
 		}
+	}
+	if len(manifest.ProofSources) != len(expectedProofs) {
+		t.Errorf("proof source count = %d, want %d", len(manifest.ProofSources), len(expectedProofs))
 	}
 
 	if len(manifest.Examples) != 1 {
