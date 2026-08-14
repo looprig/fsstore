@@ -9,3 +9,6 @@ testdata/fuzz/
 
 # Editor/OS cruft
 .DS_Store
+
+# Local feature worktrees are workspace structure, not release content.
+/.worktrees/
