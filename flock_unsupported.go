@@ -2,7 +2,19 @@
 
 package fsstore
 
-import "os"
+import (
+	"errors"
+	"os"
+)
+
+// errFlockUnsupported is the leaf cause reported on a platform that provides no
+// advisory file locking. It is a sentinel with no context fields.
+//
+// It lives beside the only code that returns it. Declared in the portable
+// flock.go it was invisible to every unix build -- staticcheck reported it as
+// unused (U1000) there, and deleting it on that evidence would have broken the
+// !unix build outright.
+var errFlockUnsupported = errors.New("fsstore: advisory file locking is not supported on this platform")
 
 // lockFileEx fails closed on a platform without advisory file locking: fsstore
 // cannot guarantee two processes will not corrupt a shared file, so it refuses

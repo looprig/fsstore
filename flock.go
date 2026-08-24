@@ -1,9 +1,6 @@
 package fsstore
 
-import (
-	"errors"
-	"strconv"
-)
+import "strconv"
 
 // This file declares the cross-process advisory-lock helper shared by fsstore's
 // backends (the ledger here; later the leaser). The lock is an OS advisory file
@@ -12,10 +9,6 @@ import (
 // platform mechanism lives in the build-tagged flock_unix.go / flock_unsupported.go;
 // a platform without advisory locking fails closed with a *FlockError rather than
 // degrading to a silent no-op (which would let two processes corrupt a file).
-
-// errFlockUnsupported is the leaf cause reported on a platform that provides no
-// advisory file locking. It is a sentinel with no context fields.
-var errFlockUnsupported = errors.New("fsstore: advisory file locking is not supported on this platform")
 
 // FlockError reports that acquiring or releasing a cross-process advisory lock
 // failed. Op is "lock" or "unlock"; Cause carries the underlying syscall error
