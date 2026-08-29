@@ -1656,8 +1656,9 @@ func TestOrderedLogCancellationAfterFreshNamespaceSetupLeavesNoFrame(t *testing.
 
 // TestOrderedLogCancellationAfterOpeningExistingNamespaceDoesNotModifyBytes
 // proves the same late cancellation cannot alter, truncate, or extend committed
-// history. Once the cancelled call returns, an uncancelled control still appends
-// the next complete frame.
+// history — including a recoverable zero-filled tail. Once the cancelled call
+// returns, an uncancelled control recovers that tail and appends the next
+// complete frame.
 func TestOrderedLogCancellationAfterOpeningExistingNamespaceDoesNotModifyBytes(t *testing.T) {
 	t.Parallel()
 	store, root := newTestOrderedLogStore(t)
@@ -1665,23 +1666,35 @@ func TestOrderedLogCancellationAfterOpeningExistingNamespaceDoesNotModifyBytes(t
 	if err != nil {
 		t.Fatalf("logFor: %v", err)
 	}
-	mustAppend(t, log, createMutation("host", "alpha", 1))
+	alpha := createMutation("host", "alpha", 1)
+	mustAppend(t, log, alpha)
 	logPath := filepath.Join(root, orderedDirName, "sessions"+orderedLogExt)
+	good := readFile(t, logPath)
+	writeFile(t, logPath, append(append([]byte(nil), good...), bytes.Repeat([]byte{0}, 64)...))
 	before := readFile(t, logPath)
 	ctx := &cancelOnErrObservationContext{
 		Context:  context.Background(),
 		cancelAt: 4,
 		done:     make(chan struct{}),
 	}
-	seq, err := commitMutation(ctx, log, createMutation("host", "beta", 2))
+	beta := createMutation("host", "beta", 2)
+	seq, err := commitMutation(ctx, log, beta)
 	if !errors.Is(err, context.Canceled) || seq != 0 {
 		t.Fatalf("existing create cancelled after open = (%d, %T %v), want (0, context.Canceled)", seq, err, err)
 	}
 	if after := readFile(t, logPath); !bytes.Equal(after, before) {
 		t.Fatalf("late cancellation modified existing log: %d bytes -> %d bytes", len(before), len(after))
 	}
-	if gotSeq, appendErr := commitMutation(context.Background(), log, createMutation("host", "beta", 2)); appendErr != nil || gotSeq != 2 {
+	if gotSeq, appendErr := commitMutation(context.Background(), log, beta); appendErr != nil || gotSeq != 2 {
 		t.Fatalf("uncancelled control after late cancellation = (%d, %v), want (2, nil)", gotSeq, appendErr)
+	}
+	frame, err := encodeOrderedFrame(2, beta)
+	if err != nil {
+		t.Fatalf("encode expected frame 2: %v", err)
+	}
+	want := append(append([]byte(nil), good...), frame...)
+	if after := readFile(t, logPath); !bytes.Equal(after, want) {
+		t.Fatalf("uncancelled control did not replace zero tail with frame 2: got %d bytes, want %d", len(after), len(want))
 	}
 }
 
