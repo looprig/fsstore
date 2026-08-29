@@ -48,20 +48,95 @@ func createMutation(scope string, key storage.StableKey, order uint64) orderedMu
 	}
 }
 
+// commitMutation commits m through the log's ONE write path. The log layer has
+// no second entry point: withView open-locks-catches up-decides-appends, and
+// production and these tests take exactly the same route through it, so no
+// durability property proved here is proved about code the index does not run.
+//
+// It validates m first, mirroring what a public method does before it opens
+// anything, so a mutation the codec cannot represent never reaches the file.
+func commitMutation(ctx context.Context, log *orderedLog, m orderedMutation) (uint64, error) {
+	if verr := validateOrderedMutation(m); verr != nil {
+		return 0, verr
+	}
+	return log.withView(ctx, true, func(*orderedView) (orderedDecision, error) {
+		return orderedDecision{mutation: &m}, nil
+	})
+}
+
+// commitCreate allocates the next acceptance order in scope from the caught-up
+// view and commits a create for key in the SAME critical section, exactly as
+// CreateOrdered does. Concurrency tests must allocate this way rather than
+// pre-assigning an order: an order chosen outside the lock is a check-then-act
+// race, and the view refuses a create whose order does not exceed the scope's
+// high-water mark.
+func commitCreate(ctx context.Context, log *orderedLog, scope string, key storage.StableKey) (seq uint64, order uint64, err error) {
+	seq, err = log.withView(ctx, true, func(v *orderedView) (orderedDecision, error) {
+		order = v.highWater[scope] + 1
+		m := createMutation(scope, key, order)
+		return orderedDecision{mutation: &m}, nil
+	})
+	return seq, order, err
+}
+
+// replayMutations brings log's view up to date through the live path — which is
+// where a torn tail is recovered — and then reads the recovered file back as the
+// mutations it holds. It is an OBSERVATION of the log, not a second way to walk
+// it: the recovery it asserts about has already happened, in production code.
+func replayMutations(ctx context.Context, t *testing.T, log *orderedLog) ([]orderedMutation, error) {
+	t.Helper()
+	if _, err := log.withView(ctx, false, func(*orderedView) (orderedDecision, error) {
+		return orderedDecision{}, nil
+	}); err != nil {
+		return nil, err
+	}
+	data, rerr := os.ReadFile(log.path) // #nosec G304 -- test-local path from t.TempDir
+	if errors.Is(rerr, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if rerr != nil {
+		t.Fatalf("read %s: %v", log.path, rerr)
+	}
+	mutations, _, _, serr := scanOrderedLog(data, log.path, 1)
+	return mutations, serr
+}
+
+// writeRawFrames writes an arbitrary sequence of mutations to a namespace's log
+// file as raw frames, bypassing every consistency check the write path makes. It
+// is the only way to build a log this package could not have written — which is
+// exactly what a fail-closed test needs.
+func writeRawFrames(t *testing.T, root, namespace string, mutations []orderedMutation) string {
+	t.Helper()
+	path := filepath.Join(root, orderedDirName, filepath.FromSlash(namespace)+orderedLogExt)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	var data []byte
+	for i, m := range mutations {
+		frame, err := encodeOrderedFrame(uint64(i+1), m)
+		if err != nil {
+			t.Fatalf("encode frame %d: %v", i+1, err)
+		}
+		data = append(data, frame...)
+	}
+	writeFile(t, path, data)
+	return path
+}
+
 // mustAppend appends m and returns the assigned log sequence.
 func mustAppend(t *testing.T, log *orderedLog, m orderedMutation) uint64 {
 	t.Helper()
-	seq, err := log.append(context.Background(), m)
+	seq, err := commitMutation(context.Background(), log, m)
 	if err != nil {
 		t.Fatalf("append %+v: %v", m, err)
 	}
 	return seq
 }
 
-// mustReplay replays log and returns its mutations.
+// mustReplay reads log back and returns its mutations.
 func mustReplay(t *testing.T, log *orderedLog) []orderedMutation {
 	t.Helper()
-	got, err := log.replay(context.Background())
+	got, err := replayMutations(context.Background(), t, log)
 	if err != nil {
 		t.Fatalf("replay: %v", err)
 	}
@@ -297,7 +372,7 @@ func TestOrderedLogRejectsUnwritableStableKey(t *testing.T) {
 			if err != nil {
 				t.Fatalf("logFor: %v", err)
 			}
-			if seq, aerr := log.append(context.Background(), createMutation("host", tt.key, 1)); aerr == nil {
+			if seq, aerr := commitMutation(context.Background(), log, createMutation("host", tt.key, 1)); aerr == nil {
 				t.Fatalf("append of an unrepresentable key succeeded at seq %d", seq)
 			} else {
 				var ce *OrderedCodecError
@@ -439,31 +514,28 @@ func TestOrderedTornTailRecovers(t *testing.T) {
 
 // TestOrderedCorruptionFailsClosed models damage that truncation cannot repair.
 // Unlike a torn tail, every declared byte is present, so the log must refuse to
-// replay rather than silently drop or misread a committed mutation.
+// read rather than silently drop or misread a committed mutation — and it must
+// refuse to be EXTENDED too, because a new frame written past damage buries it.
 //
-// appendFailsClosed records where the append path draws its line. Append
-// re-scans at the FRAME layer only (see scanOrderedLog), so it refuses to extend
-// a log whose framing it cannot read — but a CRC-valid frame carrying an illegal
-// PAYLOAD is invisible to it. That is the deliberate cost of keeping append
-// linear rather than re-decoding all history on every cross-process call; the
-// damage is not buried either way, because replay still fails closed afterwards.
+// There is one path to the file and it decodes every frame it reads, so the line
+// is the same for a read and a write: framing damage and payload damage both
+// fail closed. (An earlier design re-scanned at the frame layer only on the
+// write path, which left a CRC-valid frame carrying an illegal payload invisible
+// to an append.)
 func TestOrderedCorruptionFailsClosed(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name              string
-		appendFailsClosed bool
-		corrupt           func(t *testing.T, path string)
+		name    string
+		corrupt func(t *testing.T, path string)
 	}{
 		{
-			name:              "checksum mismatch in a committed frame",
-			appendFailsClosed: true,
+			name: "checksum mismatch in a committed frame",
 			corrupt: func(t *testing.T, path string) {
 				flipByte(t, path, frameHeaderSize+orderedMutationHeaderSize)
 			},
 		},
 		{
-			name:              "checksum mismatch in the first frame header",
-			appendFailsClosed: true,
+			name: "checksum mismatch in the first frame header",
 			corrupt: func(t *testing.T, path string) {
 				flipByte(t, path, 4) // a CRC byte
 			},
@@ -471,8 +543,7 @@ func TestOrderedCorruptionFailsClosed(t *testing.T) {
 		{
 			// Framing-valid, payload-illegal: replay must fail closed, but the
 			// frame-layer append re-scan cannot see it.
-			name:              "unknown payload version inside a valid frame",
-			appendFailsClosed: false,
+			name: "unknown payload version inside a valid frame",
 			corrupt: func(t *testing.T, path string) {
 				// Rebuild frame 1 around a payload whose version byte is bumped,
 				// so the CRC agrees and only the codec can reject it.
@@ -494,8 +565,7 @@ func TestOrderedCorruptionFailsClosed(t *testing.T) {
 			},
 		},
 		{
-			name:              "non-contiguous frame sequence",
-			appendFailsClosed: true,
+			name: "non-contiguous frame sequence",
 			corrupt: func(t *testing.T, path string) {
 				// Rewrite frame 1's sequence to 5. The frame header's CRC covers
 				// only the payload, so the frame stays individually valid and the
@@ -519,8 +589,7 @@ func TestOrderedCorruptionFailsClosed(t *testing.T) {
 			// an unwritten tail either: something other than this writer produced
 			// it, and truncating there would be guessing. Only a seq-0 frame
 			// whose whole remainder is zero is recoverable.
-			name:              "seq-zero frame carrying a real payload",
-			appendFailsClosed: true,
+			name: "seq-zero frame carrying a real payload",
 			corrupt: func(t *testing.T, path string) {
 				frame, eerr := encodeOrderedFrame(0, createMutation("host", "ghost", 3))
 				if eerr != nil {
@@ -530,8 +599,7 @@ func TestOrderedCorruptionFailsClosed(t *testing.T) {
 			},
 		},
 		{
-			name:              "garbage appended as a whole oversized frame",
-			appendFailsClosed: true,
+			name: "garbage appended as a whole oversized frame",
 			corrupt: func(t *testing.T, path string) {
 				data := readFile(t, path)
 				// A declared length beyond MaxFramePayload is corruption, not a
@@ -572,7 +640,7 @@ func TestOrderedCorruptionFailsClosed(t *testing.T) {
 				t.Fatalf("cold logFor: %v", lerr)
 			}
 
-			got, rerr := coldLog.replay(context.Background())
+			got, rerr := replayMutations(context.Background(), t, coldLog)
 			if rerr == nil {
 				t.Fatalf("replay of a corrupt log returned %d mutations, want an error", len(got))
 			}
@@ -591,25 +659,12 @@ func TestOrderedCorruptionFailsClosed(t *testing.T) {
 			}
 
 			// Appending must fail closed too — a writer must never extend a log
-			// whose framing it cannot read, which would bury the damage under
-			// new records. Payload-level damage is outside what the frame-layer
-			// re-scan can see, and there the requirement is only that the append
-			// does not conceal it: replay must still fail closed afterwards.
-			seq, aerr := coldLog.append(context.Background(), createMutation("host", "gamma", 3))
-			switch {
-			case tt.appendFailsClosed:
-				if aerr == nil {
-					t.Errorf("append to a corrupt log succeeded at seq %d, want an error", seq)
-				} else if !errors.As(aerr, &ce) {
-					t.Errorf("append error = %T %v, want *OrderedLogCorruptError", aerr, aerr)
-				}
-			default:
-				if aerr != nil {
-					t.Errorf("frame-layer-valid log: append = %v, want success", aerr)
-				}
-				if _, rerr2 := coldLog.replay(context.Background()); !errors.As(rerr2, &ce) {
-					t.Errorf("replay after append = %T %v, want the damage still reported", rerr2, rerr2)
-				}
+			// it cannot read, which would bury the damage under new records.
+			seq, aerr := commitMutation(context.Background(), coldLog, createMutation("host", "gamma", 3))
+			if aerr == nil {
+				t.Errorf("append to a corrupt log succeeded at seq %d, want an error", seq)
+			} else if !errors.As(aerr, &ce) {
+				t.Errorf("append error = %T %v, want *OrderedLogCorruptError", aerr, aerr)
 			}
 			// Nothing may be silently repaired or discarded: a corrupt log keeps
 			// at least the bytes it had, so an operator can still recover them.
@@ -728,11 +783,12 @@ func TestOrderedLogConcurrentAppendsSerialize(t *testing.T) {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	seen := make(map[uint64]bool, writers)
+	orders := make(map[uint64]bool, writers)
 	for i := range writers {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			seq, aerr := log.append(context.Background(), createMutation("host", storage.StableKey("k"+strconv.Itoa(i)), uint64(i+1)))
+			seq, order, aerr := commitCreate(context.Background(), log, "host", storage.StableKey("k"+strconv.Itoa(i)))
 			if aerr != nil {
 				t.Errorf("concurrent append %d: %v", i, aerr)
 				return
@@ -743,6 +799,10 @@ func TestOrderedLogConcurrentAppendsSerialize(t *testing.T) {
 				t.Errorf("sequence %d assigned twice", seq)
 			}
 			seen[seq] = true
+			if orders[order] {
+				t.Errorf("acceptance order %d allocated twice", order)
+			}
+			orders[order] = true
 		}(i)
 	}
 	wg.Wait()
@@ -887,7 +947,7 @@ func runOrderedAppendChild(root, keyPrefix, count string) int {
 	}
 	for i := range n {
 		key := storage.StableKey(keyPrefix + "-" + strconv.Itoa(i))
-		if _, aerr := log.append(context.Background(), createMutation("host", key, uint64(i+1))); aerr != nil {
+		if _, _, aerr := commitCreate(context.Background(), log, "host", key); aerr != nil {
 			os.Stderr.WriteString("child: append: " + aerr.Error() + "\n")
 			return 2
 		}
@@ -925,7 +985,10 @@ func TestOrderedAppendBlocksOnAForeignLock(t *testing.T) {
 	}
 
 	done := make(chan error, 1)
-	go func() { _, aerr := log.append(context.Background(), createMutation("host", "beta", 2)); done <- aerr }()
+	go func() {
+		_, aerr := commitMutation(context.Background(), log, createMutation("host", "beta", 2))
+		done <- aerr
+	}()
 	select {
 	case aerr := <-done:
 		t.Fatalf("append completed (%v) while a foreign advisory lock was held", aerr)
@@ -985,7 +1048,7 @@ func TestOrderedLogCrossProcessAppendsSerialize(t *testing.T) {
 		defer wg.Done()
 		for i := range perActor {
 			key := storage.StableKey("parent-" + strconv.Itoa(i))
-			if _, aerr := log.append(context.Background(), createMutation("host", key, uint64(i+1))); aerr != nil {
+			if _, _, aerr := commitCreate(context.Background(), log, "host", key); aerr != nil {
 				t.Errorf("parent append %d: %v", i, aerr)
 				return
 			}
@@ -1009,19 +1072,52 @@ func TestOrderedLogCrossProcessAppendsSerialize(t *testing.T) {
 	}
 }
 
-// TestOrderedWarmLogDropsItsCacheOnCorruption covers the one corruption path no
-// other test reaches: a WARM log (loaded, with a cached tip/size) that hits
-// corruption on a re-scan. Every other corruption test uses a cold store, where
-// loaded is already false.
+// warmView brings log's in-memory view up to date through the live read path and
+// leaves it loaded, so a following operation is a WARM one. Every test below
+// that models "a warm view meets damage" needs this: the incremental catch-up
+// path behaves differently from a cold rebuild, and it is the path production
+// takes on every call after the first.
+func warmView(t *testing.T, log *orderedLog) {
+	t.Helper()
+	if _, err := log.withView(context.Background(), false, func(*orderedView) (orderedDecision, error) {
+		return orderedDecision{}, nil
+	}); err != nil {
+		t.Fatalf("warm the view: %v", err)
+	}
+	if !log.viewLoaded {
+		t.Fatal("view is not loaded after a successful read")
+	}
+}
+
+// appendRaw appends bytes to a log file behind the store's back, modelling
+// another writer (or a crash) that changed the file since this handle last
+// looked at it.
+func appendRaw(t *testing.T, path string, tail []byte) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600) // #nosec G304 -- test-local path from t.TempDir
+	if err != nil {
+		t.Fatalf("open for append: %v", err)
+	}
+	if _, werr := f.Write(tail); werr != nil {
+		t.Fatalf("append raw bytes: %v", werr)
+	}
+	if cerr := f.Close(); cerr != nil {
+		t.Fatalf("close: %v", cerr)
+	}
+}
+
+// TestOrderedWarmViewRecoversATornTail covers the quadrant every other recovery
+// test misses: a torn tail in front of a WARM view. A cold rebuild re-reads the
+// file from zero, so its truncation is exercised by any torn-tail test at all;
+// the incremental catch-up truncates a DIFFERENT offset — l.applied+goodEnd, not
+// goodEnd — and advances the applied position by goodEnd rather than to the
+// file's size. Neither of those is observable until a warm handle meets damage.
 //
-// The cache MUST be invalidated by the failed scan. If it were not, the log
-// would keep a stale tip/size, and a later append whose on-disk size happened to
-// match that stale size would take refresh's size-equality fast path and write a
-// frame at the cached offset — extending, and eventually overwriting, a log it
-// cannot read. The sequence below reproduces exactly that: corrupt a committed
-// frame while ALSO changing the length (so the scan runs and fails), then restore
-// the original length (so the fast path would fire).
-func TestOrderedWarmLogDropsItsCacheOnCorruption(t *testing.T) {
+// The torn tail here is deliberately LONGER than the frame that replaces it, so
+// a catch-up that failed to truncate would leave junk BEHIND the new frame
+// instead of overwriting it, and one that advanced applied to the file size
+// would write past the junk and leave a hole.
+func TestOrderedWarmViewRecoversATornTail(t *testing.T) {
 	t.Parallel()
 	store, root := newTestOrderedLogStore(t)
 	const namespace = "sessions"
@@ -1033,32 +1129,156 @@ func TestOrderedWarmLogDropsItsCacheOnCorruption(t *testing.T) {
 		mustAppend(t, log, createMutation("host", key, uint64(i+1)))
 	}
 	logPath := filepath.Join(root, orderedDirName, namespace+orderedLogExt)
-	committed := readFile(t, logPath)
-
-	// Damage a committed frame in place AND change the length, so the warm
-	// log's size check forces a re-scan that then fails.
-	damaged := append([]byte{}, committed...)
-	damaged[frameHeaderSize+orderedMutationHeaderSize] ^= 0xFF
-	writeFile(t, logPath, append(append([]byte{}, damaged...), make([]byte, 8)...))
-
-	var ce *OrderedLogCorruptError
-	if seq, aerr := log.append(context.Background(), createMutation("host", "gamma", 3)); aerr == nil {
-		t.Fatalf("warm append over a corrupt log succeeded at seq %d, want an error", seq)
-	} else if !errors.As(aerr, &ce) {
-		t.Fatalf("warm append error = %T %v, want *OrderedLogCorruptError", aerr, aerr)
+	goodEnd := fileSize(t, logPath)
+	warmView(t, log)
+	if log.applied != goodEnd {
+		t.Fatalf("warm applied = %d, want %d", log.applied, goodEnd)
 	}
 
-	// Restore the ORIGINAL length, leaving the damage in place. A stale cache
-	// would now match on size and skip the scan entirely.
-	writeFile(t, logPath, damaged)
+	// A wide third frame, one byte short: a crash mid-append.
+	wide := createMutation("host", "gamma", 3)
+	wide.Value = bytes.Repeat([]byte{0x7E}, 4096)
+	wideFrame, eerr := encodeOrderedFrame(3, wide)
+	if eerr != nil {
+		t.Fatalf("encode wide frame: %v", eerr)
+	}
+	appendRaw(t, logPath, wideFrame[:len(wideFrame)-1])
+
+	// The warm handle must truncate that tail and land the next frame exactly at
+	// the last whole frame's end.
+	narrow := createMutation("host", "gamma", 3)
+	seq, aerr := commitMutation(context.Background(), log, narrow)
+	if aerr != nil {
+		t.Fatalf("warm append over a torn tail: %v", aerr)
+	}
+	if seq != 3 {
+		t.Errorf("warm append seq = %d, want 3", seq)
+	}
+	narrowFrame, eerr := encodeOrderedFrame(3, narrow)
+	if eerr != nil {
+		t.Fatalf("encode narrow frame: %v", eerr)
+	}
+	if len(narrowFrame) >= len(wideFrame)-1 {
+		t.Fatalf("the torn tail (%d bytes) must be wider than its replacement (%d)", len(wideFrame)-1, len(narrowFrame))
+	}
+	wantSize := goodEnd + int64(len(narrowFrame))
+	if size := fileSize(t, logPath); size != wantSize {
+		t.Fatalf("log size after a warm recovery = %d, want %d: the torn tail was not truncated away", size, wantSize)
+	}
+
+	// And the file is genuinely readable from cold: three whole frames, no junk.
+	cold, cerr := newOrderedLogStore(root)
+	if cerr != nil {
+		t.Fatalf("reopen: %v", cerr)
+	}
+	defer func() {
+		if err := cold.Close(); err != nil {
+			t.Errorf("close cold store: %v", err)
+		}
+	}()
+	coldLog, lerr := cold.logFor(namespace)
+	if lerr != nil {
+		t.Fatalf("cold logFor: %v", lerr)
+	}
+	got := mustReplay(t, coldLog)
+	if len(got) != 3 || !mutationsEqual(got[2], narrow) {
+		t.Fatalf("cold replay after a warm recovery = %+v, want alpha, beta and the replacement gamma", got)
+	}
+}
+
+// TestOrderedWarmViewFailsClosedOnADamagedTail is the other half of the warm
+// quadrant: the frame appended behind the warm handle's back is COMPLETE but
+// contradicts the state it applies to, so it is caught by the fold rather than
+// by the scan. That is the only way to reach the poison guard inside catch-up's
+// fold loop — on a cold catch-up the view is unloaded already, so dropping it
+// there changes nothing.
+func TestOrderedWarmViewFailsClosedOnADamagedTail(t *testing.T) {
+	t.Parallel()
+	store, root := newTestOrderedLogStore(t)
+	const namespace = "sessions"
+	log, err := store.logFor(namespace)
+	if err != nil {
+		t.Fatalf("logFor: %v", err)
+	}
+	for i, key := range []storage.StableKey{"alpha", "beta"} {
+		mustAppend(t, log, createMutation("host", key, uint64(i+1)))
+	}
+	logPath := filepath.Join(root, orderedDirName, namespace+orderedLogExt)
+	warmView(t, log)
+
+	// A well-framed, CRC-correct frame 3 that re-creates an identity the view
+	// already holds: truncation cannot repair it, and folding it in would leave
+	// the indexes quietly wrong.
+	ghost, eerr := encodeOrderedFrame(3, createMutation("host", "alpha", 1))
+	if eerr != nil {
+		t.Fatalf("encode contradicting frame: %v", eerr)
+	}
+	appendRaw(t, logPath, ghost)
 	before := readFile(t, logPath)
-	if seq, aerr := log.append(context.Background(), createMutation("host", "delta", 4)); aerr == nil {
-		t.Errorf("append on a stale warm cache succeeded at seq %d, want an error", seq)
-	} else if !errors.As(aerr, &ce) {
-		t.Errorf("second warm append error = %T %v, want *OrderedLogCorruptError", aerr, aerr)
+
+	var ce *OrderedLogCorruptError
+	seq, aerr := commitMutation(context.Background(), log, createMutation("host", "gamma", 3))
+	if aerr == nil {
+		t.Fatalf("warm append over a contradicting frame succeeded at seq %d, want an error", seq)
+	}
+	if !errors.As(aerr, &ce) || !errors.Is(aerr, errOrderedInconsistentLog) {
+		t.Fatalf("warm append error = %T %v, want *OrderedLogCorruptError wrapping errOrderedInconsistentLog", aerr, aerr)
+	}
+	if log.viewLoaded {
+		t.Error("the view stayed loaded after a half-applied fold; the next read would serve it")
+	}
+	// The failure is sticky and nothing was written.
+	if _, again := commitMutation(context.Background(), log, createMutation("host", "delta", 4)); !errors.As(again, &ce) {
+		t.Errorf("second warm append = %v, want the same failure", again)
 	}
 	if after := readFile(t, logPath); !bytes.Equal(after, before) {
 		t.Errorf("a rejected append modified the log: %d bytes -> %d bytes", len(before), len(after))
+	}
+}
+
+// TestOrderedWarmViewRebuildsWhenTheLogShrinks pins catch-up's shrink guard. A
+// warm view holds an applied OFFSET into a file it believes it is a prefix of;
+// if the file is now shorter than that offset it is a different file — truncated
+// or replaced — and the applied prefix is not its prefix. Without the size check
+// the catch-up would size its read buffer to a NEGATIVE span and panic.
+//
+// The guard's limitation is deliberate and not fixed here: a log REPLACED at the
+// same or a greater length is not detected at all, because detection is by size
+// alone. That is the same single-writer-per-namespace assumption the ledger
+// documents; under it, neither case can occur.
+func TestOrderedWarmViewRebuildsWhenTheLogShrinks(t *testing.T) {
+	t.Parallel()
+	store, root := newTestOrderedLogStore(t)
+	const namespace = "sessions"
+	log, err := store.logFor(namespace)
+	if err != nil {
+		t.Fatalf("logFor: %v", err)
+	}
+	first := createMutation("host", "alpha", 1)
+	mustAppend(t, log, first)
+	logPath := filepath.Join(root, orderedDirName, namespace+orderedLogExt)
+	afterFirst := fileSize(t, logPath)
+	mustAppend(t, log, createMutation("host", "beta", 2))
+	warmView(t, log)
+	if log.applied <= afterFirst {
+		t.Fatalf("warm applied = %d, want more than %d", log.applied, afterFirst)
+	}
+
+	// Roll the file back to one frame behind the warm view's back.
+	if terr := os.Truncate(logPath, afterFirst); terr != nil {
+		t.Fatalf("truncate: %v", terr)
+	}
+
+	got := mustReplay(t, log)
+	if len(got) != 1 || !mutationsEqual(got[0], first) {
+		t.Fatalf("warm read of a shrunken log = %+v, want just alpha", got)
+	}
+	if log.applied != afterFirst {
+		t.Errorf("applied after the rebuild = %d, want %d", log.applied, afterFirst)
+	}
+	// The rebuilt view is usable: the next frame continues from the new tip.
+	if seq, aerr := commitMutation(context.Background(), log, createMutation("host", "beta", 2)); aerr != nil || seq != 2 {
+		t.Fatalf("append after a rebuild = (%d, %v), want (2, nil)", seq, aerr)
 	}
 }
 
@@ -1145,7 +1365,7 @@ func TestOrderedLogCorruptErrorPrecedence(t *testing.T) {
 
 	// Caller garbage: the bare codec error, with no corruption wrapper.
 	badInput := createMutation("host", "", 1)
-	if _, aerr := log.append(context.Background(), badInput); aerr == nil {
+	if _, aerr := commitMutation(context.Background(), log, badInput); aerr == nil {
 		t.Fatal("append of an invalid mutation succeeded")
 	} else if !errors.As(aerr, &ce) {
 		t.Fatalf("caller-input error = %T %v, want *OrderedCodecError", aerr, aerr)
@@ -1181,7 +1401,7 @@ func TestOrderedLogCorruptErrorPrecedence(t *testing.T) {
 	if lerr != nil {
 		t.Fatalf("cold logFor: %v", lerr)
 	}
-	_, rerr := coldLog.replay(context.Background())
+	_, rerr := replayMutations(context.Background(), t, coldLog)
 	if !errors.As(rerr, &lce) {
 		t.Fatalf("disk-damage error = %T %v, want *OrderedLogCorruptError", rerr, rerr)
 	}
@@ -1339,10 +1559,10 @@ func TestOrderedLogHonorsCancellationBeforeWork(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if seq, aerr := log.append(ctx, createMutation("host", "beta", 2)); !errors.Is(aerr, context.Canceled) {
+	if seq, aerr := commitMutation(ctx, log, createMutation("host", "beta", 2)); !errors.Is(aerr, context.Canceled) {
 		t.Errorf("append(cancelled) = (%d, %v), want context.Canceled", seq, aerr)
 	}
-	if _, rerr := log.replay(ctx); !errors.Is(rerr, context.Canceled) {
+	if _, rerr := replayMutations(ctx, t, log); !errors.Is(rerr, context.Canceled) {
 		t.Errorf("replay(cancelled) = %v, want context.Canceled", rerr)
 	}
 	if after := readFile(t, logPath); !bytes.Equal(after, before) {
@@ -1396,7 +1616,7 @@ func TestOrderedFirstAppendFsyncsTheDirectoryChain(t *testing.T) {
 	// and must surface the failure as a typed IO error rather than being skipped.
 	unreadable()
 	var ioErr *OrderedLogIOError
-	seq, aerr := log.append(context.Background(), createMutation("host", "alpha", 1))
+	seq, aerr := commitMutation(context.Background(), log, createMutation("host", "alpha", 1))
 	if aerr == nil {
 		t.Fatalf("creating append succeeded at seq %d despite an unopenable directory", seq)
 	}
@@ -1422,7 +1642,7 @@ func TestOrderedFirstAppendFsyncsTheDirectoryChain(t *testing.T) {
 	// A LATER append finds a non-empty log, so created is false and the chain
 	// fsync is skipped: the unopenable directory no longer matters.
 	unreadable()
-	if got, err := log.append(context.Background(), createMutation("host", "gamma", 3)); err != nil {
+	if got, err := commitMutation(context.Background(), log, createMutation("host", "gamma", 3)); err != nil {
 		t.Fatalf("non-creating append = (%d, %v), want success (the dir fsync must be skipped)", got, err)
 	}
 	readable()
@@ -2370,8 +2590,9 @@ func TestOrderedIndexRejectsInvalidListArguments(t *testing.T) {
 func TestOrderedIndexInconsistentLogFailsClosed(t *testing.T) {
 	t.Parallel()
 
-	// Each case writes frames DIRECTLY through the log, bypassing the index, and
-	// then asks a cold index to read the namespace back.
+	// Each case writes RAW frames straight to the log file, bypassing every
+	// consistency check the write path makes — no caller of this package can
+	// produce such a log — and then asks a cold index to read the namespace back.
 	cases := []struct {
 		name   string
 		frames []orderedMutation
@@ -2413,14 +2634,8 @@ func TestOrderedIndexInconsistentLogFailsClosed(t *testing.T) {
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
-			store, root := newTestOrderedLogStore(t)
-			log, err := store.logFor("sessions")
-			if err != nil {
-				t.Fatalf("logFor: %v", err)
-			}
-			for _, frame := range testCase.frames {
-				mustAppend(t, log, frame)
-			}
+			root := t.TempDir()
+			writeRawFrames(t, root, "sessions", testCase.frames)
 
 			index := openTestOrderedIndex(t, root)
 			_, gerr := index.ListOrdered(context.Background(), "sessions", "host", 0, 10)

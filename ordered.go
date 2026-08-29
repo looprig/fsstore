@@ -3,7 +3,6 @@ package fsstore
 import (
 	"context"
 	"errors"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -29,8 +28,8 @@ import (
 // crash between advancing it and writing the record, which either burns an order
 // or — far worse — lets the same order be handed out twice. A create frame
 // carries the allocated order inside the same durable append as the record, so
-// there is no window. Replay recovers each scope's high-water mark as the
-// maximum order it observes; nothing else needs to be durable.
+// there is no window. Reading the log back recovers each scope's high-water mark
+// as the maximum order it observes; nothing else needs to be durable.
 //
 // Second, invariant #15 of the orchestration plan forbids provider-unbounded
 // paging: KV.Keys, filesystem-wide walks, and scans of historical records are
@@ -42,37 +41,49 @@ import (
 // # Open item: the log is never compacted
 //
 // What the previous paragraph buys is a bounded READ path. It does not make the
-// startup path bounded, and this file does not yet solve that. replay returns
-// EVERY mutation ever written for a namespace — each carrying up to 1 MiB of
-// Value — all live at once, so open cost is proportional to total HISTORY rather
-// than to live records: 10k records updated 100 times each is 1M mutations
-// decoded and held before the first read is served. That is a real trade of
-// unbounded paging for unbounded startup memory and time, not a solved problem.
+// COLD path bounded, and this file does not yet solve that. A cold catch-up
+// decodes EVERY mutation ever written for a namespace — each carrying up to
+// 1 MiB of Value — and reads the whole file into one buffer to do it, so first
+// use costs total HISTORY rather than live records: 10k records updated 100
+// times each is 1M mutations decoded before the first read is served. There is
+// no log-size limit anywhere in this module, and no incremental reader: a
+// namespace whose log has outgrown available memory cannot be opened at all.
+// That is a real trade of unbounded paging for unbounded startup memory and
+// time, not a solved problem.
 //
 // Closing it needs one of two things, neither built here: a checkpoint/snapshot
-// file that replay starts from and the log tail replays onto, or a
+// file the cold path starts from and the log tail folds onto, or a
 // rewrite-and-rename compaction (fold the log to one frame per live identity
 // into a temp file, fsync, rename, fsync the directory) performed under the same
-// advisory lock that guards append. Until then a namespace's log grows without
-// bound and a caller should treat replay's cost as O(total mutations).
+// advisory lock that guards a commit. Until then a namespace's log grows without
+// bound and a caller should treat a cold open as O(total mutations).
 //
 // # Locking model
 //
-// This mirrors the ledger's proven two-layer model, and the append critical
-// section holds both layers:
+// This mirrors the ledger's proven two-layer model, and ONE critical section —
+// withView — holds both layers for every read and every write alike:
 //
 //   - In-process: a store mutex guards the namespace->orderedLog registry; each
 //     orderedLog carries its own mutex serializing every operation on that one
 //     namespace. The registry mutex is only ever held to look a log up, never
 //     while a log's mutex is held, so the two cannot deadlock.
 //   - Cross-process: an exclusive advisory lock (flock LOCK_EX) is taken on the
-//     log file for the duration of each append and each replay, and released
-//     before the call returns — a per-operation lock, never held open across
-//     calls. A crashed holder's lock is reclaimed by the kernel, so no stale-lock
-//     cleanup is ever required.
+//     log file for the duration of each operation and released before the call
+//     returns — a per-operation lock, never held open across calls. A crashed
+//     holder's lock is reclaimed by the kernel, so no stale-lock cleanup is ever
+//     required.
 //
-// Both replay and append take the advisory lock because both may TRUNCATE a torn
-// tail, which is a write.
+// A READ takes the exclusive lock too, because a read may discover and truncate
+// a torn tail, which is a write.
+//
+// # There is exactly one path to the file
+//
+// Every operation — Get, Create, Update, Delete, and all three listings — enters
+// through withView, which opens, locks, catches the view up, lets the caller
+// decide, and appends at most one frame. There is deliberately no second
+// commit path and no second recovery path: two implementations of "open, lock,
+// recover, append, fsync" would share every invariant and could drift apart
+// silently, and only one of them would be the one production uses.
 //
 // # Fault model
 //
@@ -84,13 +95,18 @@ import (
 // size before the data blocks). scanOrderedLog explains why the last two are not
 // self-evident and why misclassifying them would brick a namespace.
 //
+// "Tail" is load-bearing in all three: a zero region, or a seq-0 frame, with
+// anything nonzero behind it is a HOLE where an acknowledged frame used to be,
+// and truncating there would discard committed mutations AND free their
+// acceptance orders for reuse. Only a zero run that reaches the end of the file
+// is recoverable.
+//
 // Anything else — a checksum mismatch, a frame that decodes to an illegal
 // mutation, or a sequence gap — is corruption that truncation cannot repair, and
 // every operation fails closed with an *OrderedLogCorruptError rather than
-// silently dropping or misreading a committed mutation. In particular an append
-// refuses to extend a log whose FRAMING it cannot read; payload-level damage is
-// caught by replay rather than by append, a bounded weakening that scanOrderedLog
-// states and TestOrderedCorruptionFailsClosed pins.
+// silently dropping or misreading a committed mutation. Because there is one
+// path and it decodes every frame it reads, payload-level damage fails an append
+// exactly as framing damage does: a writer never extends a log it cannot read.
 //
 // # StableKey never reaches a path
 //
@@ -322,23 +338,19 @@ type orderedLog struct {
 	path      string
 	stopDir   string // <root>/ordered: the top of the dir-fsync chain
 
-	mu     sync.Mutex
-	loaded bool
-	tip    uint64
-	size   int64
+	mu sync.Mutex
 
-	// The current-view cache. It is deliberately SEPARATE from loaded/tip/size
-	// above: those track how far the frame-layer scan has read, which the append
-	// path advances WITHOUT decoding anything. view/applied/appliedSeq track how
-	// far mutations have actually been folded into the in-memory indexes. Keeping
-	// them apart is what makes catchUp correct no matter which path last touched
-	// the log — it always resumes from applied, never from size.
+	// The current-view cache, and the ONLY cached position: there is exactly one
+	// path that reads or writes this file (withView), so there is exactly one
+	// notion of how far it has got. applied is the byte offset just past the last
+	// frame folded into view, and appliedSeq is that frame's sequence. Together
+	// they are the whole of invariant 15's requirement here: a warm reader
+	// re-reads NOTHING before applied, so a page costs the tail written since it
+	// last looked, not the history of the namespace.
 	//
-	// applied is the byte offset just past the last frame folded into view, and
-	// appliedSeq is that frame's sequence. Together they are the whole of
-	// invariant 15's requirement here: a warm reader re-reads NOTHING before
-	// applied, so a page costs the tail written since it last looked, not the
-	// history of the namespace.
+	// By construction applied is always the offset just past a WHOLE frame — no
+	// torn tail is ever cached — so an append extends the file at applied
+	// directly.
 	view       *orderedView
 	viewLoaded bool
 	applied    int64
@@ -349,219 +361,6 @@ type orderedLog struct {
 	scannedBytes  int64
 	appliedFrames uint64
 	catchUps      uint64
-}
-
-// replay reads the whole log and returns its mutations in append order — the
-// startup path that rebuilds a namespace's in-memory index. An absent log is an
-// empty one, not an error. A torn tail is truncated away before the mutations are
-// returned, so the log is left in the exact state the next append expects; any
-// other fault returns an *OrderedLogCorruptError and no mutations.
-//
-// It takes the advisory lock because recovery truncates, which is a write.
-//
-// ctx is checked ONCE, before any lock is taken, and not again: the in-process
-// mutex and the blocking LOCK_EX that follow are not cancellable, and the file
-// work between them is a single bounded read. Cancellation therefore refuses to
-// START work; it never abandons work in progress, which for a path that may
-// truncate a torn tail is the only safe reading.
-func (l *orderedLog) replay(ctx context.Context) (mutations []orderedMutation, err error) {
-	if cerr := ctx.Err(); cerr != nil {
-		return nil, cerr
-	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	f, oerr := os.OpenFile(l.path, os.O_RDWR, 0o600) // #nosec G304 -- l.path is validated and contained under <root>/ordered
-	if errors.Is(oerr, fs.ErrNotExist) {
-		l.loaded, l.tip, l.size = true, 0, 0
-		return nil, nil
-	}
-	if oerr != nil {
-		return nil, &OrderedLogIOError{Op: "open", Path: l.path, Cause: oerr}
-	}
-	// Defers run LIFO: unlock (registered second) releases the advisory lock
-	// before close (registered first) releases the fd.
-	defer func() {
-		if cerr := f.Close(); cerr != nil && err == nil {
-			mutations, err = nil, &OrderedLogIOError{Op: "close", Path: l.path, Cause: cerr}
-		}
-	}()
-	if lerr := lockFileEx(f); lerr != nil {
-		return nil, lerr
-	}
-	defer func() {
-		if uerr := unlockFile(f); uerr != nil && err == nil {
-			mutations, err = nil, uerr
-		}
-	}()
-
-	decoded, rerr := l.recover(f, true)
-	if rerr != nil {
-		return nil, rerr
-	}
-	return decoded, nil
-}
-
-// append durably commits one mutation as the next frame of the log. It
-// serializes per-namespace in-process, takes an exclusive cross-process advisory
-// lock for the critical section, recovers a torn tail before reading the tip,
-// fsyncs the file, and — on first creation — fsyncs the ancestor directory chain
-// so the new directory entries are durable too. It returns the assigned frame
-// sequence.
-//
-// The mutation is validated BEFORE any file is opened, so a rejected mutation
-// writes nothing. (It may still leave an EMPTY log file behind: O_CREATE fires
-// before the on-disk state is read, so a first append rejected by the log rather
-// than by the codec creates the file without a frame. An empty log is
-// indistinguishable from an absent one to every reader here.) A log whose FRAMING
-// cannot be read fails the append closed: a writer must never extend a log it
-// cannot read.
-//
-// ctx is checked once, before any lock is taken, and not again — see replay for
-// why.
-//
-// The seq return is meaningful ON ERROR. A non-nil error with a NONZERO seq
-// means the frame WAS committed and fsynced and a step AFTER it failed — the
-// ancestor directory fsync, the close, or the unlock. The caller must not read
-// that as "nothing happened" and retry: for CreateOrdered a retry would burn a
-// second order for one identity. Only a zero seq means nothing was written.
-func (l *orderedLog) append(ctx context.Context, m orderedMutation) (seq uint64, err error) {
-	if cerr := ctx.Err(); cerr != nil {
-		return 0, cerr
-	}
-	if verr := validateOrderedMutation(m); verr != nil {
-		return 0, verr
-	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	dir := filepath.Dir(l.path)
-	// Best-effort and idempotent: ensure the directory tree exists before
-	// opening. The durability-critical CREATION decision is NOT made here — it is
-	// derived below from on-disk state read under the advisory lock, so a
-	// concurrent removal racing this MkdirAll cannot skip the directory fsync.
-	if merr := os.MkdirAll(dir, 0o700); merr != nil {
-		return 0, &OrderedLogIOError{Op: "mkdir", Path: dir, Cause: merr}
-	}
-
-	f, oerr := os.OpenFile(l.path, os.O_RDWR|os.O_CREATE, 0o600) // #nosec G304 -- l.path is validated and contained under <root>/ordered
-	if oerr != nil {
-		return 0, &OrderedLogIOError{Op: "open", Path: l.path, Cause: oerr}
-	}
-	// These two defers deliberately leave seq alone. They only fire when the
-	// append already returned successfully, so seq is the sequence of a frame
-	// that is on the disk and fsynced; zeroing it would report a committed
-	// mutation as "nothing happened" and invite a duplicate retry.
-	defer func() {
-		if cerr := f.Close(); cerr != nil && err == nil {
-			err = &OrderedLogIOError{Op: "close", Path: l.path, Cause: cerr}
-		}
-	}()
-	if lerr := lockFileEx(f); lerr != nil {
-		return 0, lerr
-	}
-	defer func() {
-		if uerr := unlockFile(f); uerr != nil && err == nil {
-			err = uerr
-		}
-	}()
-
-	if rerr := l.refresh(f); rerr != nil {
-		return 0, rerr
-	}
-	// Authoritative creation decision from on-disk state observed under the lock:
-	// an empty log means its directory entries may be newly created and need an
-	// fsync to be crash-durable. A torn-to-zero recovery also lands here, making
-	// the directory fsync redundant — a negligible cost.
-	created := l.size == 0
-
-	frame, eerr := encodeOrderedFrame(l.tip+1, m)
-	if eerr != nil {
-		return 0, eerr // an invalid mutation: a definite failure, never ambiguous
-	}
-	if _, werr := f.WriteAt(frame, l.size); werr != nil {
-		return 0, &OrderedLogIOError{Op: "write", Path: l.path, Cause: werr}
-	}
-	if serr := f.Sync(); serr != nil {
-		return 0, &OrderedLogIOError{Op: "fsync", Path: l.path, Cause: serr}
-	}
-	// The frame is now on the disk and fsynced, so the cache advances HERE,
-	// before the last durability step. Everything after this point can fail
-	// without the frame ceasing to exist, and the returned seq has to say so.
-	l.tip++
-	l.size += int64(len(frame))
-	if created {
-		// A nested namespace (factory/hosts) creates directories several levels
-		// deep, so fsync the chain from the file's directory up to and including
-		// <root>/ordered.
-		if derr := fsyncDirChain(dir, l.stopDir, orderedIOErr); derr != nil {
-			// The frame is committed; only the durability of the new directory
-			// entries is in doubt. Report both facts: the error, and the seq
-			// that says a retry would duplicate the mutation, not replace it.
-			return l.tip, derr
-		}
-	}
-	return l.tip, nil
-}
-
-// refresh brings the cached tip/size in sync with the on-disk file for the
-// append path, which does not need the decoded mutations — so it re-scans with
-// decode false and never materializes the log's history. The fast path skips the
-// scan entirely when the cache is valid and the file size is unchanged; the
-// cross-process path, where a second writer's append changes the size, misses
-// that fast path on EVERY call, which is exactly why the re-scan must stay at
-// the frame layer (see scanOrderedLog).
-//
-// The size-equality fast path is sound under the same single-writer-per-namespace
-// assumption the ledger documents: it detects a cross-process change by size
-// alone, so a removal and recreation that happened to land an identical byte
-// count would stale the cache. Under single-writer discipline that cannot occur.
-func (l *orderedLog) refresh(f *os.File) error {
-	st, serr := f.Stat()
-	if serr != nil {
-		return &OrderedLogIOError{Op: "stat", Path: l.path, Cause: serr}
-	}
-	if l.loaded && st.Size() == l.size {
-		return nil
-	}
-	_, err := l.recover(f, false)
-	return err
-}
-
-// recover scans the whole file, truncates a torn tail back to the last whole
-// frame, updates the cached tip/size, and — when decode is true — returns the
-// decoded mutations in append order. It is called only under both the
-// per-namespace mutex and the advisory lock, so the file is quiescent.
-//
-// On any error the cache is left UNLOADED, so a later operation re-scans rather
-// than trusting metadata derived from an unreadable file.
-func (l *orderedLog) recover(f *os.File, decode bool) ([]orderedMutation, error) {
-	l.loaded = false
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return nil, &OrderedLogIOError{Op: "seek", Path: l.path, Cause: err}
-	}
-	data, rerr := io.ReadAll(f)
-	if rerr != nil {
-		return nil, &OrderedLogIOError{Op: "read", Path: l.path, Cause: rerr}
-	}
-	mutations, lastSeq, goodEnd, scerr := scanOrderedLog(data, l.path, decode, 1)
-	if scerr != nil {
-		return nil, scerr // fail closed: corruption truncation cannot repair
-	}
-	if goodEnd < int64(len(data)) {
-		// A torn tail (a crash mid-append): roll the file back to the last whole
-		// frame. The partial mutation was never acknowledged to any caller.
-		if terr := f.Truncate(goodEnd); terr != nil {
-			return nil, &OrderedLogIOError{Op: "truncate", Path: l.path, Cause: terr}
-		}
-		if fserr := f.Sync(); fserr != nil {
-			return nil, &OrderedLogIOError{Op: "fsync", Path: l.path, Cause: fserr}
-		}
-	}
-	l.tip = lastSeq
-	l.size = goodEnd
-	l.loaded = true
-	return mutations, nil
 }
 
 // allZero reports whether every byte of b is zero. It is only ever called once
@@ -580,31 +379,23 @@ func allZero(b []byte) bool {
 // goodEnd — the byte offset just past the last whole frame, relative to the
 // START of data — plus, when decode is true, every mutation in append order.
 //
-// expect is the sequence the FIRST frame in data must carry. A whole-file scan
-// passes 1; an incremental catch-up passes the successor of the last sequence it
+// expect is the sequence the FIRST frame in data must carry. A cold scan passes
+// 1; an incremental catch-up passes the successor of the last sequence it
 // already applied and hands in only the unapplied tail, which is what lets a warm
-// reader keep its contiguity check without re-reading the prefix.
-//
-// decode is the append/replay split. replay needs the mutations; append needs
-// only the tip and goodEnd, so it passes false and the walk stops at the FRAME
-// layer, paying CRC and sequence verification without materializing a mutation
-// (and its scope/key/value allocations) per frame. The stated tradeoff: a
-// structure-only walk no longer catches a CRC-valid frame carrying an illegal
-// payload, so on the append path "a writer must never extend a log it cannot
-// read" weakens to "...whose FRAMING it cannot read". That is the ledger's
-// existing bargain, and it is the right one: the alternative is a fully quadratic
-// append (every append decoding all history) with unbounded memory whenever the
-// cross-process path misses the size-equality fast path — which is every append
-// when two writers share a namespace, the configuration the flock exists for.
-// replay still validates every payload, so an illegal frame fails closed at the
-// next open.
+// reader keep its contiguity check without re-reading the prefix. Because the
+// prefix is never re-read, the walk is linear in the bytes appended since the
+// caller last looked rather than in the history of the namespace — so every
+// frame is fully decoded, and a CRC-valid frame carrying an illegal PAYLOAD
+// fails closed exactly like a damaged one.
 //
 // A torn tail stops the walk cleanly at goodEnd and is recoverable by
 // truncation. Three artifacts are torn:
 //
 //   - an incomplete final frame (the frame layer reports it short);
-//   - a frame stamped with sequence 0, which this writer can never emit because
-//     append always stamps l.tip+1 >= 1;
+//   - a frame stamped with sequence 0 whose whole remainder is zero. This writer
+//     can never emit sequence 0, because a commit always stamps appliedSeq+1 >= 1;
+//     a seq-0 frame with anything nonzero behind it is therefore not an unwritten
+//     tail but a HOLE, and is corruption (see below);
 //   - a trailing region that is entirely zero. This is the most common
 //     post-crash artifact of all — a filesystem that journalled the new file
 //     size before the data blocks leaves the extended region reading as zeros —
@@ -612,13 +403,15 @@ func allZero(b []byte) bool {
 //     valid frame (len 0, crc 0, and crc32c of an empty payload is exactly 0)
 //     whose empty payload then fails the codec. Classifying that as corruption
 //     would brick the namespace: replay fails, append fails closed, and there is
-//     no repair path. The seq-0 rule already covers an aligned zero region; the
-//     explicit all-zero check covers an unaligned one.
+//     no repair path. The seq-0 rule covers an aligned zero region and the
+//     explicit all-zero check covers an unaligned one, and BOTH require the zeros
+//     to run to the end of the buffer — a zero region with data behind it is
+//     damage, not an unwritten tail.
 //
 // Every other fault — a checksum mismatch, an over-ceiling declared length, a
 // frame that decodes to an illegal mutation, or a sequence gap — returns an
 // *OrderedLogCorruptError and no mutations.
-func scanOrderedLog(data []byte, path string, decode bool, expect uint64) (mutations []orderedMutation, lastSeq uint64, goodEnd int64, err error) {
+func scanOrderedLog(data []byte, path string, expect uint64) (mutations []orderedMutation, lastSeq uint64, goodEnd int64, err error) {
 	off := 0
 	for off < len(data) {
 		seq, payload, n, derr := decodeFrame(data[off:])
@@ -644,13 +437,11 @@ func scanOrderedLog(data []byte, path string, decode bool, expect uint64) (mutat
 		if seq != expect {
 			return nil, 0, 0, &OrderedLogCorruptError{Path: path, Seq: seq, Cause: errOrderedNonContiguousSeq}
 		}
-		if decode {
-			m, cerr := decodeOrderedMutation(payload)
-			if cerr != nil {
-				return nil, 0, 0, &OrderedLogCorruptError{Path: path, Seq: seq, Cause: cerr}
-			}
-			mutations = append(mutations, m)
+		m, cerr := decodeOrderedMutation(payload)
+		if cerr != nil {
+			return nil, 0, 0, &OrderedLogCorruptError{Path: path, Seq: seq, Cause: cerr}
 		}
+		mutations = append(mutations, m)
 		off += n
 		lastSeq = seq
 		expect++
@@ -1092,7 +883,7 @@ func (l *orderedLog) catchUp(f *os.File) error {
 	}
 	l.scannedBytes += span
 
-	mutations, lastSeq, goodEnd, scerr := scanOrderedLog(tail, l.path, true, l.appliedSeq+1)
+	mutations, lastSeq, goodEnd, scerr := scanOrderedLog(tail, l.path, l.appliedSeq+1)
 	if scerr != nil {
 		l.viewLoaded = false
 		return scerr
@@ -1125,10 +916,6 @@ func (l *orderedLog) catchUp(f *os.File) error {
 	}
 	l.applied += goodEnd
 	l.viewLoaded = true
-	// The frame-layer cache the append path consults has just been re-derived by
-	// the very same scan, so publish it too. Without this, append's refresh would
-	// see a changed size and redo the whole-file scan catch-up just avoided.
-	l.tip, l.size, l.loaded = l.appliedSeq, l.applied, true
 	return nil
 }
 
@@ -1216,7 +1003,6 @@ func (l *orderedLog) withView(ctx context.Context, mutating bool, fn func(v *ord
 		// creating a file to say so would litter the store with empty logs.
 		l.resetView()
 		l.viewLoaded = true
-		l.loaded, l.tip, l.size = true, 0, 0
 		_, ferr := fn(l.view)
 		return 0, ferr
 	}
@@ -1245,7 +1031,7 @@ func (l *orderedLog) withView(ctx context.Context, mutating bool, fn func(v *ord
 		return 0, cerr
 	}
 	// Authoritative creation decision from on-disk state observed under the lock.
-	created := l.size == 0
+	created := l.applied == 0
 
 	decision, ferr := fn(l.view)
 	if ferr != nil {
@@ -1255,11 +1041,11 @@ func (l *orderedLog) withView(ctx context.Context, mutating bool, fn func(v *ord
 		return 0, nil
 	}
 
-	frame, eerr := encodeOrderedFrame(l.tip+1, *decision.mutation)
+	frame, eerr := encodeOrderedFrame(l.appliedSeq+1, *decision.mutation)
 	if eerr != nil {
 		return 0, eerr // an invalid mutation: a definite failure, never ambiguous
 	}
-	if _, werr := f.WriteAt(frame, l.size); werr != nil {
+	if _, werr := f.WriteAt(frame, l.applied); werr != nil {
 		return 0, &OrderedLogIOError{Op: "write", Path: l.path, Cause: werr}
 	}
 	if serr := f.Sync(); serr != nil {
@@ -1268,23 +1054,23 @@ func (l *orderedLog) withView(ctx context.Context, mutating bool, fn func(v *ord
 	// Durable from here on. Advance the cache and fold the frame in BEFORE the
 	// remaining durability step, so everything after this point can fail without
 	// the mutation ceasing to exist — and so a retry sees it.
-	l.tip++
-	l.size += int64(len(frame))
+	l.appliedSeq++
+	l.applied += int64(len(frame))
 	if aerr := l.view.apply(*decision.mutation); aerr != nil {
-		// Unreachable: fn derived this mutation from this very view. If it ever
-		// fires, the view is half-applied, so drop it and rebuild on next use.
+		// The frame is durable, so the log now holds a mutation the view refuses.
+		// fn derives its mutation from this very view, so a caller of this
+		// package cannot reach here; a log written by something else can. Drop
+		// the view so the next use rebuilds and fails closed on the same frame.
 		l.viewLoaded = false
-		return l.tip, &OrderedLogCorruptError{Path: l.path, Seq: l.tip, Cause: aerr}
+		return l.appliedSeq, &OrderedLogCorruptError{Path: l.path, Seq: l.appliedSeq, Cause: aerr}
 	}
-	l.applied = l.size
-	l.appliedSeq = l.tip
 	l.appliedFrames++
 	if created {
 		if derr := fsyncDirChain(dir, l.stopDir, orderedIOErr); derr != nil {
-			return l.tip, derr
+			return l.appliedSeq, derr
 		}
 	}
-	return l.tip, nil
+	return l.appliedSeq, nil
 }
 
 // ---------------------------------------------------------------------------
