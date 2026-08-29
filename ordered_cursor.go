@@ -44,8 +44,18 @@ import (
 //
 // Integer fields are parsed CANONICALLY: only the exact spelling
 // strconv.FormatInt would emit is accepted, so "+7", "007", and "7" are not
-// three tokens for one position. That keeps the encoding injective, which is
-// what makes "the same page yields the same cursor" a testable property.
+// three tokens for one position.
+//
+// That does NOT make the token space injective in the decoding direction, and
+// the encoding does not claim it. Go's base64.RawURLEncoding accepts
+// non-canonical trailing bits when decoding — "eA" and "eB" both decode to "x" —
+// so each of the five base64 fields has many accepted spellings, and so does the
+// outer payload. Only the two integer fields are strictly canonical. What IS
+// guaranteed is injectivity of ENCODE: one position renders to exactly one
+// token, always the same one, which is what makes "the same page yields the same
+// cursor" a testable property. Nothing here depends on a token having a unique
+// spelling — a cursor names a position and grants nothing, so a second spelling
+// of the same position is not a privilege escalation, only a wasted forgery.
 
 const (
 	// orderedCursorVersionField is the payload's version token — the same
