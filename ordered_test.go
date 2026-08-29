@@ -1426,3 +1426,1305 @@ func TestOrderedFirstAppendFsyncsTheDirectoryChain(t *testing.T) {
 		t.Fatalf("replayed %d mutations, want 3", len(got))
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Current views: order, rank, and due
+// ---------------------------------------------------------------------------
+
+// newTestOrderedIndex returns an OrderedIndex over a fresh temp root, plus that
+// root, and closes it at the end of the test.
+func newTestOrderedIndex(t *testing.T) (*orderedIndex, string) {
+	t.Helper()
+	root := t.TempDir()
+	return openTestOrderedIndex(t, root), root
+}
+
+// openTestOrderedIndex opens ANOTHER independent handle on root. Two handles
+// share no mutex and no view — only the log files and the advisory lock — so a
+// test using two of them exercises the same path two processes would.
+func openTestOrderedIndex(t *testing.T, root string) *orderedIndex {
+	t.Helper()
+	index, err := newOrderedIndex(root)
+	if err != nil {
+		t.Fatalf("newOrderedIndex(%q): %v", root, err)
+	}
+	t.Cleanup(func() {
+		if cerr := index.Close(); cerr != nil {
+			t.Errorf("close ordered index: %v", cerr)
+		}
+	})
+	return index
+}
+
+// orderedID is shorthand for an identity in the "sessions" namespace.
+func orderedID(scope string, key storage.StableKey) storage.OrderedID {
+	return storage.OrderedID{Namespace: "sessions", OrderingScope: scope, StableKey: key}
+}
+
+func ranked(value int64) storage.Rank { return storage.Rank{Ranked: true, Value: value} }
+
+func dueAt(millis int64) storage.Due {
+	return storage.Due{State: storage.DueAt, UnixMillis: millis}
+}
+
+// mustCreate creates id and requires that it was newly created.
+func mustCreate(t *testing.T, x *orderedIndex, id storage.OrderedID, rank storage.Rank, due storage.Due) storage.OrderedRecord {
+	t.Helper()
+	record, created, err := x.Create(context.Background(), id, "catalog", []byte("v:"+string(id.StableKey)), rank, due)
+	if err != nil {
+		t.Fatalf("Create(%+v): %v", id, err)
+	}
+	if !created {
+		t.Fatalf("Create(%+v): created=false, want a fresh record", id)
+	}
+	return record
+}
+
+// keysOf renders a record slice as "orderingScope/stableKey" strings, which is
+// what the sort-key assertions compare — the full identity, so a tiebreaker
+// failure is visible rather than aliased away.
+func keysOf(records []storage.OrderedRecord) []string {
+	out := make([]string, 0, len(records))
+	for _, record := range records {
+		out = append(out, record.ID.OrderingScope+"/"+string(record.ID.StableKey))
+	}
+	return out
+}
+
+func equalStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// mustListRanked pages ListRanked to exhaustion at the given page size and
+// returns every record in order, plus the number of pages it took.
+func mustListRanked(t *testing.T, x *orderedIndex, namespace, rankingScope string, limit int) ([]storage.OrderedRecord, int) {
+	t.Helper()
+	var (
+		all    []storage.OrderedRecord
+		cursor storage.RankedCursor
+		pages  int
+	)
+	for {
+		page, err := x.ListRanked(context.Background(), namespace, rankingScope, cursor, limit)
+		if err != nil {
+			t.Fatalf("ListRanked(page %d): %v", pages, err)
+		}
+		pages++
+		all = append(all, page.Records...)
+		if page.NextCursor == "" {
+			return all, pages
+		}
+		if pages > 100 {
+			t.Fatalf("ListRanked did not terminate after %d pages", pages)
+		}
+		cursor = page.NextCursor
+	}
+}
+
+// mustListDue pages ListDue to exhaustion at the given bound and page size.
+func mustListDue(t *testing.T, x *orderedIndex, namespace string, bound int64, limit int) ([]storage.OrderedRecord, int) {
+	t.Helper()
+	var (
+		all    []storage.OrderedRecord
+		cursor storage.DueCursor
+		pages  int
+	)
+	for {
+		page, err := x.ListDue(context.Background(), namespace, bound, cursor, limit)
+		if err != nil {
+			t.Fatalf("ListDue(page %d): %v", pages, err)
+		}
+		pages++
+		all = append(all, page.Records...)
+		if page.NextCursor == "" {
+			return all, pages
+		}
+		if pages > 100 {
+			t.Fatalf("ListDue did not terminate after %d pages", pages)
+		}
+		cursor = page.NextCursor
+	}
+}
+
+// mustListOrdered pages ListOrdered to exhaustion for one order scope.
+func mustListOrdered(t *testing.T, x *orderedIndex, namespace, orderingScope string, limit int) []storage.OrderedRecord {
+	t.Helper()
+	var (
+		all   []storage.OrderedRecord
+		after uint64
+	)
+	for i := 0; ; i++ {
+		page, err := x.ListOrdered(context.Background(), namespace, orderingScope, after, limit)
+		if err != nil {
+			t.Fatalf("ListOrdered(after %d): %v", after, err)
+		}
+		if len(page.Records) == 0 {
+			return all
+		}
+		all = append(all, page.Records...)
+		after = page.NextAfterOrder
+		if i > 100 {
+			t.Fatalf("ListOrdered did not terminate after %d pages", i)
+		}
+	}
+}
+
+// TestOrderedIndexReopenRestoresViews is the durability test for the views
+// themselves: everything a reopened index reports about order, rank, due, and
+// tombstones must come from replaying the log, because a fresh handle has no
+// memory at all. It also pins the two facts a reopen is most likely to lose —
+// that a tombstoned identity's order is NOT reused, and that the high-water mark
+// survives even though nothing stores it.
+func TestOrderedIndexReopenRestoresViews(t *testing.T) {
+	t.Parallel()
+	first, root := newTestOrderedIndex(t)
+	ctx := context.Background()
+
+	alive := mustCreate(t, first, orderedID("host-a", "alpha"), ranked(50), dueAt(1_000))
+	moved := mustCreate(t, first, orderedID("host-a", "beta"), ranked(10), dueAt(3_000))
+	doomed := mustCreate(t, first, orderedID("host-b", "gamma"), ranked(90), dueAt(2_000))
+
+	// Move beta's rank and due time, then tombstone gamma.
+	updated, err := first.Update(ctx, moved.ID, moved.Revision, []byte("moved"), ranked(70), dueAt(500))
+	if err != nil {
+		t.Fatalf("Update(beta): %v", err)
+	}
+	tombstone, err := first.Delete(ctx, doomed.ID, doomed.Revision)
+	if err != nil {
+		t.Fatalf("Delete(gamma): %v", err)
+	}
+
+	if cerr := first.Close(); cerr != nil {
+		t.Fatalf("close first handle: %v", cerr)
+	}
+
+	second := openTestOrderedIndex(t, root)
+
+	for _, want := range []storage.OrderedRecord{alive, updated, tombstone} {
+		got, gerr := second.Get(ctx, want.ID)
+		if gerr != nil {
+			t.Fatalf("reopened Get(%+v): %v", want.ID, gerr)
+		}
+		if got.Revision != want.Revision || got.Order != want.Order || got.Deleted != want.Deleted ||
+			got.Rank != want.Rank || got.Due != want.Due || got.RankingScope != want.RankingScope ||
+			!bytes.Equal(got.Value, want.Value) {
+			t.Fatalf("reopened Get(%+v) = %+v, want %+v", want.ID, got, want)
+		}
+	}
+
+	// The ranked view after a reopen must reflect beta's MOVED rank (70), not the
+	// rank its create frame carried (10), and must exclude the tombstone.
+	rankedRecords, _ := mustListRanked(t, second, "sessions", "catalog", 10)
+	if got, want := keysOf(rankedRecords), []string{"host-a/beta", "host-a/alpha"}; !equalStrings(got, want) {
+		t.Fatalf("reopened ListRanked = %v, want %v", got, want)
+	}
+	// Likewise the due view: beta moved to 500, ahead of alpha's 1000, and gamma
+	// left the view entirely when it was tombstoned.
+	dueRecords, _ := mustListDue(t, second, "sessions", 10_000, 10)
+	if got, want := keysOf(dueRecords), []string{"host-a/beta", "host-a/alpha"}; !equalStrings(got, want) {
+		t.Fatalf("reopened ListDue = %v, want %v", got, want)
+	}
+
+	// The acceptance-order stream INCLUDES the tombstone: it is the immutable
+	// stream, and a consumer resuming from an order cursor has to observe the
+	// delete.
+	streamB := mustListOrdered(t, second, "sessions", "host-b", 10)
+	if len(streamB) != 1 || !streamB[0].Deleted {
+		t.Fatalf("reopened ListOrdered(host-b) = %+v, want one tombstone", streamB)
+	}
+
+	// A tombstoned identity's order is never reused, and the high-water mark that
+	// guarantees it was recovered from the log rather than stored.
+	fresh := mustCreate(t, second, orderedID("host-b", "delta"), ranked(1), dueAt(9_000))
+	if fresh.Order <= tombstone.Order {
+		t.Fatalf("post-reopen create took order %d, want strictly greater than the tombstoned %d",
+			fresh.Order, tombstone.Order)
+	}
+	// And the identity itself can never come back.
+	if _, _, cerr := second.Create(ctx, doomed.ID, "catalog", []byte("resurrect"), ranked(5), dueAt(1)); cerr != nil {
+		t.Fatalf("Create on a tombstone: %v", cerr)
+	}
+	revived, gerr := second.Get(ctx, doomed.ID)
+	if gerr != nil || !revived.Deleted || revived.Revision != tombstone.Revision {
+		t.Fatalf("Create on a tombstone changed it: %+v (err %v), want the tombstone %+v", revived, gerr, tombstone)
+	}
+}
+
+// TestOrderedIndexTwoHandlesCreateOnce drives concurrent creates from two
+// INDEPENDENT handles on one root. The handles share no mutex and no view, so
+// the only thing that can stop both from finding the identity absent and both
+// allocating an order is the exclusive advisory lock held across catch-up,
+// decision, and append. Exactly one create must win, every caller must be told
+// the same record, and the distinct identities created alongside must all get
+// distinct orders.
+func TestOrderedIndexTwoHandlesCreateOnce(t *testing.T) {
+	t.Parallel()
+	_, root := newTestOrderedIndex(t)
+	left := openTestOrderedIndex(t, root)
+	right := openTestOrderedIndex(t, root)
+	ctx := context.Background()
+
+	const racers = 8
+	contested := orderedID("host", "contested")
+
+	var (
+		mu       sync.Mutex
+		wins     int
+		observed []storage.OrderedRecord
+		wg       sync.WaitGroup
+	)
+	for i := range racers {
+		handle := left
+		if i%2 == 1 {
+			handle = right
+		}
+		wg.Add(1)
+		go func(handle *orderedIndex, i int) {
+			defer wg.Done()
+			// Every racer proposes a DIFFERENT value, so a second winner would be
+			// visible as a changed record rather than hidden by identical inputs.
+			record, created, err := handle.Create(ctx, contested, "catalog",
+				[]byte("racer-"+strconv.Itoa(i)), ranked(int64(i)), dueAt(int64(i)))
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				t.Errorf("racer %d Create: %v", i, err)
+				return
+			}
+			if created {
+				wins++
+			}
+			observed = append(observed, record)
+			// A distinct identity per racer, to prove order allocation stays
+			// unique under the same contention.
+			if _, _, uerr := handle.Create(ctx, orderedID("host", storage.StableKey("solo-"+strconv.Itoa(i))),
+				"catalog", nil, storage.Rank{}, storage.Due{}); uerr != nil {
+				t.Errorf("racer %d solo Create: %v", i, uerr)
+			}
+		}(handle, i)
+	}
+	wg.Wait()
+
+	if wins != 1 {
+		t.Fatalf("concurrent Create on one identity reported created=true %d times, want exactly 1", wins)
+	}
+	for _, record := range observed {
+		if record.Revision != 1 || record.Order != observed[0].Order || !bytes.Equal(record.Value, observed[0].Value) {
+			t.Fatalf("racers disagree about the created record: %+v vs %+v", record, observed[0])
+		}
+	}
+
+	// Every create is on the disk exactly once, with a unique, strictly
+	// increasing order — read back through a THIRD cold handle so the assertion
+	// is about the log, not about either writer's memory.
+	stream := mustListOrdered(t, openTestOrderedIndex(t, root), "sessions", "host", 100)
+	if len(stream) != racers+1 {
+		t.Fatalf("ListOrdered returned %d records, want %d", len(stream), racers+1)
+	}
+	seen := make(map[uint64]bool, len(stream))
+	var previous uint64
+	for _, record := range stream {
+		if seen[record.Order] {
+			t.Fatalf("order %d allocated twice", record.Order)
+		}
+		if record.Order <= previous {
+			t.Fatalf("ListOrdered is not ascending: %d after %d", record.Order, previous)
+		}
+		seen[record.Order] = true
+		previous = record.Order
+	}
+}
+
+// TestOrderedIndexUpdateCASPrecedence pins the contract's precedence exactly:
+// absent and deleted are reported regardless of the expected revision, and only
+// for a LIVE record is the candidate validated — before a stale revision is
+// reported. Getting that order wrong is invisible in isolation and wrong in
+// every caller that distinguishes "retry me" from "your input is bad".
+func TestOrderedIndexUpdateCASPrecedence(t *testing.T) {
+	t.Parallel()
+	x, _ := newTestOrderedIndex(t)
+	ctx := context.Background()
+
+	absent := orderedID("host", "absent")
+	var notFound *storage.OrderedRecordNotFoundError
+	if _, err := x.Update(ctx, absent, 999, nil, storage.Rank{}, storage.Due{}); !errors.As(err, &notFound) {
+		t.Fatalf("Update(absent) error = %v, want *OrderedRecordNotFoundError", err)
+	}
+
+	live := mustCreate(t, x, orderedID("host", "live"), ranked(5), dueAt(100))
+
+	// A live record with an INVALID candidate and a STALE revision must report
+	// the candidate, not the conflict.
+	var invalidDue *storage.InvalidDueError
+	if _, err := x.Update(ctx, live.ID, live.Revision+7, nil, storage.Rank{},
+		storage.Due{State: storage.NotDue, UnixMillis: 5}); !errors.As(err, &invalidDue) {
+		t.Fatalf("Update(live, stale, invalid due) error = %v, want *InvalidDueError", err)
+	}
+	// A valid candidate with a stale revision is the conflict.
+	var conflict *storage.OrderedRevisionConflictError
+	if _, err := x.Update(ctx, live.ID, live.Revision+7, []byte("x"), ranked(1), dueAt(1)); !errors.As(err, &conflict) {
+		t.Fatalf("Update(live, stale, valid) error = %v, want *OrderedRevisionConflictError", err)
+	}
+	if conflict.ActualRevision != live.Revision || conflict.ExpectedRevision != live.Revision+7 {
+		t.Fatalf("conflict = %+v, want expected %d actual %d", conflict, live.Revision+7, live.Revision)
+	}
+	// The rejected attempts changed nothing.
+	if got, gerr := x.Get(ctx, live.ID); gerr != nil || got.Revision != live.Revision || !bytes.Equal(got.Value, live.Value) {
+		t.Fatalf("after rejected updates Get = %+v (err %v), want %+v", got, gerr, live)
+	}
+
+	// The matching revision replaces value, rank, and due together, advances the
+	// revision exactly once, and touches neither order nor ranking scope.
+	next, err := x.Update(ctx, live.ID, live.Revision, []byte("after"), ranked(42), dueAt(777))
+	if err != nil {
+		t.Fatalf("Update(live, matching): %v", err)
+	}
+	if next.Revision != live.Revision+1 || next.Order != live.Order || next.RankingScope != live.RankingScope {
+		t.Fatalf("Update produced %+v, want revision %d order %d scope %q",
+			next, live.Revision+1, live.Order, live.RankingScope)
+	}
+	if next.Rank != ranked(42) || next.Due != dueAt(777) || !bytes.Equal(next.Value, []byte("after")) {
+		t.Fatalf("Update did not replace value/rank/due atomically: %+v", next)
+	}
+	// The old revision is now stale.
+	if _, err := x.Update(ctx, live.ID, live.Revision, []byte("again"), ranked(1), dueAt(1)); !errors.As(err, &conflict) {
+		t.Fatalf("Update with the consumed revision = %v, want *OrderedRevisionConflictError", err)
+	}
+}
+
+// TestOrderedIndexTombstoneLeavesTheCurrentViews checks the whole tombstone
+// contract in one place: a delete clears rank and due, leaves the ranked and due
+// views, STAYS in the acceptance-order stream, keeps its value and order, is
+// terminal for Update, and answers a retry with the original tombstone even when
+// the retry carries the pre-delete revision — which is exactly what a caller
+// whose first attempt failed ambiguously still holds.
+func TestOrderedIndexTombstoneLeavesTheCurrentViews(t *testing.T) {
+	t.Parallel()
+	x, _ := newTestOrderedIndex(t)
+	ctx := context.Background()
+
+	keep := mustCreate(t, x, orderedID("host", "keep"), ranked(1), dueAt(10))
+	victim := mustCreate(t, x, orderedID("host", "victim"), ranked(2), dueAt(20))
+
+	tombstone, err := x.Delete(ctx, victim.ID, victim.Revision)
+	if err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if !tombstone.Deleted || tombstone.Revision != victim.Revision+1 {
+		t.Fatalf("Delete produced %+v, want Deleted with revision %d", tombstone, victim.Revision+1)
+	}
+	if tombstone.Rank != (storage.Rank{}) || tombstone.Due != (storage.Due{State: storage.NotDue}) {
+		t.Fatalf("tombstone kept rank/due: %+v", tombstone)
+	}
+	if tombstone.Order != victim.Order || tombstone.RankingScope != victim.RankingScope ||
+		!bytes.Equal(tombstone.Value, victim.Value) {
+		t.Fatalf("tombstone lost order/scope/value: %+v, want from %+v", tombstone, victim)
+	}
+
+	rankedRecords, _ := mustListRanked(t, x, "sessions", "catalog", 10)
+	if got, want := keysOf(rankedRecords), []string{"host/keep"}; !equalStrings(got, want) {
+		t.Fatalf("ListRanked after delete = %v, want %v", got, want)
+	}
+	dueRecords, _ := mustListDue(t, x, "sessions", 1_000, 10)
+	if got, want := keysOf(dueRecords), []string{"host/keep"}; !equalStrings(got, want) {
+		t.Fatalf("ListDue after delete = %v, want %v", got, want)
+	}
+	stream := mustListOrdered(t, x, "sessions", "host", 10)
+	if got, want := keysOf(stream), []string{"host/keep", "host/victim"}; !equalStrings(got, want) {
+		t.Fatalf("ListOrdered after delete = %v, want %v (tombstones stay in the immutable stream)", got, want)
+	}
+	_ = keep
+
+	// Terminal for Update, regardless of revision.
+	var deleted *storage.OrderedDeletedError
+	if _, uerr := x.Update(ctx, victim.ID, tombstone.Revision, []byte("no"), ranked(9), dueAt(9)); !errors.As(uerr, &deleted) {
+		t.Fatalf("Update on a tombstone = %v, want *OrderedDeletedError", uerr)
+	}
+	// A retry carrying the PRE-delete revision gets the tombstone, not a conflict.
+	retried, rerr := x.Delete(ctx, victim.ID, victim.Revision)
+	if rerr != nil {
+		t.Fatalf("Delete retry with the pre-delete revision: %v", rerr)
+	}
+	if retried.Revision != tombstone.Revision || !retried.Deleted {
+		t.Fatalf("Delete retry = %+v, want the original tombstone %+v", retried, tombstone)
+	}
+	// So does a retry carrying a revision that never existed.
+	if again, aerr := x.Delete(ctx, victim.ID, 4242); aerr != nil || again.Revision != tombstone.Revision {
+		t.Fatalf("Delete retry with a bogus revision = %+v (err %v), want the tombstone", again, aerr)
+	}
+}
+
+// TestOrderedIndexRankedSortKeyIsTotal pins the frozen descending
+// (rank, stable_key, ordering_scope) order INCLUDING the ordering-scope
+// tiebreaker the coordinator added on 2026-08-29. Without it the comparison is
+// only a preorder: the two records below share a rank AND a stable key across
+// two ordering scopes, so a cursor could not name a unique position among them
+// and pagination at limit 1 would not terminate — which is why this test pages
+// at 1 as well as reading the whole view.
+func TestOrderedIndexRankedSortKeyIsTotal(t *testing.T) {
+	t.Parallel()
+	x, _ := newTestOrderedIndex(t)
+
+	// Two full-tie groups, created in OPPOSITE orders. One group alone is not
+	// enough: a comparator that ignores the ordering-scope tiebreaker leaves the
+	// most-recently-inserted tied record first, which coincidentally matches the
+	// required descending order for one creation order and contradicts it for the
+	// other. Only the pair pins the tiebreaker rather than the insertion order.
+	mustCreate(t, x, orderedID("host-a", "tie"), ranked(10), storage.Due{})
+	mustCreate(t, x, orderedID("host-b", "tie"), ranked(10), storage.Due{})
+	mustCreate(t, x, orderedID("host-b", "zit"), ranked(8), storage.Due{})
+	mustCreate(t, x, orderedID("host-a", "zit"), ranked(8), storage.Due{})
+	mustCreate(t, x, orderedID("host-a", "aaa"), ranked(10), storage.Due{})
+	mustCreate(t, x, orderedID("host-a", "top"), ranked(99), storage.Due{})
+	mustCreate(t, x, orderedID("host-a", "bottom"), ranked(-5), storage.Due{})
+	// Unranked and tombstoned records are absent from the ranked view.
+	mustCreate(t, x, orderedID("host-a", "unranked"), storage.Rank{}, storage.Due{})
+	doomed := mustCreate(t, x, orderedID("host-a", "doomed"), ranked(1000), storage.Due{})
+	if _, err := x.Delete(context.Background(), doomed.ID, doomed.Revision); err != nil {
+		t.Fatalf("Delete(doomed): %v", err)
+	}
+
+	want := []string{
+		"host-a/top",    // rank 99
+		"host-b/tie",    // rank 10, key "tie", scope host-b sorts before host-a descending
+		"host-a/tie",    // rank 10, key "tie"
+		"host-a/aaa",    // rank 10, key "aaa"
+		"host-b/zit",    // rank 8, the same tie resolved for the opposite creation order
+		"host-a/zit",    // rank 8
+		"host-a/bottom", // rank -5
+	}
+	whole, pages := mustListRanked(t, x, "sessions", "catalog", 1000)
+	if got := keysOf(whole); !equalStrings(got, want) {
+		t.Fatalf("ListRanked = %v, want %v", got, want)
+	}
+	if pages != 1 {
+		t.Fatalf("ListRanked at limit 1000 took %d pages, want 1", pages)
+	}
+	// One record per page forces the cursor to resolve every tie.
+	paged, pages := mustListRanked(t, x, "sessions", "catalog", 1)
+	if got := keysOf(paged); !equalStrings(got, want) {
+		t.Fatalf("ListRanked paged at limit 1 = %v, want %v", got, want)
+	}
+	if pages != len(want) {
+		t.Fatalf("ListRanked at limit 1 took %d pages for %d records, want %d", pages, len(want), len(want))
+	}
+	// A ranking scope with no records is empty and cursorless, not an error.
+	page, err := x.ListRanked(context.Background(), "sessions", "empty", "", 10)
+	if err != nil || len(page.Records) != 0 || page.NextCursor != "" {
+		t.Fatalf("ListRanked(empty scope) = %+v (err %v), want an empty terminal page", page, err)
+	}
+}
+
+// TestOrderedIndexDueSortKeyIsTotalAndBounded pins the frozen ascending
+// (due_at, stable_key, ordering_scope) order, the exclusion of not-due and
+// tombstoned records, and the fact that the bound is INCLUSIVE and stops the
+// page rather than filtering it. The due view spans every ordering scope in the
+// namespace, so the ordering-scope tiebreaker matters here even more than for
+// rank.
+func TestOrderedIndexDueSortKeyIsTotalAndBounded(t *testing.T) {
+	t.Parallel()
+	x, _ := newTestOrderedIndex(t)
+
+	// Two full-tie groups created in OPPOSITE orders, for the reason spelled out
+	// in TestOrderedIndexRankedSortKeyIsTotal: one group's expected order is
+	// reproduced by accident when the tiebreaker is missing.
+	mustCreate(t, x, orderedID("host-b", "tie"), storage.Rank{}, dueAt(200))
+	mustCreate(t, x, orderedID("host-a", "tie"), storage.Rank{}, dueAt(200))
+	mustCreate(t, x, orderedID("host-a", "pair"), storage.Rank{}, dueAt(200))
+	mustCreate(t, x, orderedID("host-b", "pair"), storage.Rank{}, dueAt(200))
+	mustCreate(t, x, orderedID("host-a", "zzz"), storage.Rank{}, dueAt(200))
+	mustCreate(t, x, orderedID("host-a", "early"), storage.Rank{}, dueAt(100))
+	mustCreate(t, x, orderedID("host-a", "late"), storage.Rank{}, dueAt(900))
+	mustCreate(t, x, orderedID("host-a", "never"), ranked(7), storage.Due{})
+	doomed := mustCreate(t, x, orderedID("host-a", "doomed"), storage.Rank{}, dueAt(50))
+	if _, err := x.Delete(context.Background(), doomed.ID, doomed.Revision); err != nil {
+		t.Fatalf("Delete(doomed): %v", err)
+	}
+
+	// Bound 200 is INCLUSIVE and excludes the 900.
+	want := []string{
+		"host-a/early",
+		"host-a/pair", // due 200, key "pair", scope host-a sorts before host-b ascending
+		"host-b/pair", // the same tie resolved for the opposite creation order
+		"host-a/tie",
+		"host-b/tie",
+		"host-a/zzz",
+	}
+	whole, _ := mustListDue(t, x, "sessions", 200, 1000)
+	if got := keysOf(whole); !equalStrings(got, want) {
+		t.Fatalf("ListDue(bound 200) = %v, want %v", got, want)
+	}
+	paged, pages := mustListDue(t, x, "sessions", 200, 1)
+	if got := keysOf(paged); !equalStrings(got, want) {
+		t.Fatalf("ListDue(bound 200) paged at limit 1 = %v, want %v", got, want)
+	}
+	if pages != len(want) {
+		t.Fatalf("ListDue at limit 1 took %d pages for %d records, want %d", pages, len(want), len(want))
+	}
+	// A bound before everything yields nothing at all.
+	if got, _ := mustListDue(t, x, "sessions", 0, 10); len(got) != 0 {
+		t.Fatalf("ListDue(bound 0) = %v, want nothing", keysOf(got))
+	}
+	// A wide bound picks up the late record too, and still never the not-due or
+	// tombstoned ones.
+	wide, _ := mustListDue(t, x, "sessions", 1_000, 10)
+	if got, wantAll := keysOf(wide), append(append([]string{}, want...), "host-a/late"); !equalStrings(got, wantAll) {
+		t.Fatalf("ListDue(bound 1000) = %v, want %v", got, wantAll)
+	}
+}
+
+// TestOrderedIndexCursorsFailClosed exercises all four rules the contract
+// requires, for both cursor kinds: a malformed token, an unknown token version,
+// a token issued for the OTHER kind, and a token whose bound query does not
+// match the live request. It also proves a cursor is position and not authority
+// by replaying one issued on a different handle.
+func TestOrderedIndexCursorsFailClosed(t *testing.T) {
+	t.Parallel()
+	x, root := newTestOrderedIndex(t)
+	ctx := context.Background()
+
+	mustCreate(t, x, orderedID("host", "one"), ranked(2), dueAt(10))
+	mustCreate(t, x, orderedID("host", "two"), ranked(1), dueAt(20))
+	// A second ranking scope and namespace, so the mismatch cases have somewhere
+	// valid to point.
+	if _, _, err := x.Create(ctx, orderedID("host", "other"), "otherscope", nil, ranked(3), dueAt(30)); err != nil {
+		t.Fatalf("Create(otherscope): %v", err)
+	}
+
+	rankedPage, err := x.ListRanked(ctx, "sessions", "catalog", "", 1)
+	if err != nil || rankedPage.NextCursor == "" {
+		t.Fatalf("ListRanked page 1 = %+v (err %v), want a continuation cursor", rankedPage, err)
+	}
+	duePage, err := x.ListDue(ctx, "sessions", 100, "", 1)
+	if err != nil || duePage.NextCursor == "" {
+		t.Fatalf("ListDue page 1 = %+v (err %v), want a continuation cursor", duePage, err)
+	}
+
+	assertCursorRule := func(t *testing.T, err error, kind storage.OrderedCursorKind, rule storage.OrderedCursorRule, what string) {
+		t.Helper()
+		var invalid *storage.InvalidOrderedCursorError
+		if !errors.As(err, &invalid) {
+			t.Fatalf("%s: error = %v, want *InvalidOrderedCursorError", what, err)
+		}
+		if invalid.Kind != kind || invalid.Rule != rule {
+			t.Fatalf("%s: got kind %v rule %v, want kind %v rule %v", what, invalid.Kind, invalid.Rule, kind, rule)
+		}
+	}
+
+	// Rule 1: malformed.
+	for _, token := range []string{"not-a-cursor", rankedCursorHeader + "!!!not-base64!!!", rankedCursorHeader} {
+		_, rerr := x.ListRanked(ctx, "sessions", "catalog", storage.RankedCursor(token), 1)
+		assertCursorRule(t, rerr, storage.RankedCursorKind, storage.OrderedCursorMalformed, "ranked malformed "+strconv.Quote(token))
+	}
+	for _, token := range []string{"not-a-cursor", dueCursorHeader + "!!!not-base64!!!", dueCursorHeader} {
+		_, derr := x.ListDue(ctx, "sessions", 100, storage.DueCursor(token), 1)
+		assertCursorRule(t, derr, storage.DueCursorKind, storage.OrderedCursorMalformed, "due malformed "+strconv.Quote(token))
+	}
+
+	// Rule 2: unknown version. The scheme is recognized, the version is not.
+	unknownRanked := strings.Replace(string(rankedPage.NextCursor), orderedCursorScheme+"1:", orderedCursorScheme+"2:", 1)
+	if unknownRanked == string(rankedPage.NextCursor) {
+		t.Fatal("failed to build an unknown-version ranked token")
+	}
+	_, rerr := x.ListRanked(ctx, "sessions", "catalog", storage.RankedCursor(unknownRanked), 1)
+	assertCursorRule(t, rerr, storage.RankedCursorKind, storage.OrderedCursorUnknownVersion, "ranked unknown version")
+	unknownDue := strings.Replace(string(duePage.NextCursor), orderedCursorScheme+"1:", orderedCursorScheme+"2:", 1)
+	_, derr := x.ListDue(ctx, "sessions", 100, storage.DueCursor(unknownDue), 1)
+	assertCursorRule(t, derr, storage.DueCursorKind, storage.OrderedCursorUnknownVersion, "due unknown version")
+
+	// Rule 3: wrong kind. A real due cursor handed to ListRanked and vice versa.
+	_, rerr = x.ListRanked(ctx, "sessions", "catalog", storage.RankedCursor(duePage.NextCursor), 1)
+	assertCursorRule(t, rerr, storage.RankedCursorKind, storage.OrderedCursorWrongKind, "due token into ListRanked")
+	_, derr = x.ListDue(ctx, "sessions", 100, storage.DueCursor(rankedPage.NextCursor), 1)
+	assertCursorRule(t, derr, storage.DueCursorKind, storage.OrderedCursorWrongKind, "ranked token into ListDue")
+
+	// Rule 4: query mismatch. The bindings are compared against the LIVE request,
+	// never adopted from the token.
+	_, rerr = x.ListRanked(ctx, "sessions", "otherscope", rankedPage.NextCursor, 1)
+	assertCursorRule(t, rerr, storage.RankedCursorKind, storage.OrderedCursorQueryMismatch, "ranked cursor in another ranking scope")
+	_, rerr = x.ListRanked(ctx, "elsewhere", "catalog", rankedPage.NextCursor, 1)
+	assertCursorRule(t, rerr, storage.RankedCursorKind, storage.OrderedCursorQueryMismatch, "ranked cursor in another namespace")
+	_, derr = x.ListDue(ctx, "sessions", 101, duePage.NextCursor, 1)
+	assertCursorRule(t, derr, storage.DueCursorKind, storage.OrderedCursorQueryMismatch, "due cursor at another bound")
+	_, derr = x.ListDue(ctx, "elsewhere", 100, duePage.NextCursor, 1)
+	assertCursorRule(t, derr, storage.DueCursorKind, storage.OrderedCursorQueryMismatch, "due cursor in another namespace")
+
+	// A cursor carries position, not authority: another handle on the same root
+	// resumes from it with no shared state.
+	other := openTestOrderedIndex(t, root)
+	resumed, err := other.ListRanked(ctx, "sessions", "catalog", rankedPage.NextCursor, 10)
+	if err != nil {
+		t.Fatalf("resume a foreign handle's cursor: %v", err)
+	}
+	// Page 1 returned "one" (rank 2); resuming from its cursor on a handle that
+	// never issued it yields the rest of the descending view.
+	if got, want := keysOf(resumed.Records), []string{"host/two"}; !equalStrings(got, want) {
+		t.Fatalf("resumed page = %v, want %v", got, want)
+	}
+}
+
+// TestOrderedIndexStableKeyNeverReachesAPath is the security assertion. A
+// StableKey is opaque caller data: it may contain '/', '..', a leading slash, a
+// NUL-adjacent oddity, or arbitrary Unicode. Only the NAMESPACE becomes a path
+// here, so however hostile the key, the store must contain exactly one file —
+// the namespace's log — and the key must still round-trip byte for byte.
+func TestOrderedIndexStableKeyNeverReachesAPath(t *testing.T) {
+	t.Parallel()
+	x, root := newTestOrderedIndex(t)
+	ctx := context.Background()
+
+	hostile := []storage.StableKey{
+		"../../../etc/passwd",
+		"..",
+		"/absolute/escape",
+		"a/b/c",
+		"..\\windows\\escape",
+		"key with spaces and ünïcode ☃",
+	}
+	for i, key := range hostile {
+		id := orderedID("host", key)
+		record, created, err := x.Create(ctx, id, "catalog", []byte(strconv.Itoa(i)), ranked(int64(i)), dueAt(int64(i)))
+		if err != nil {
+			t.Fatalf("Create(%q): %v", key, err)
+		}
+		if !created || record.ID.StableKey != key {
+			t.Fatalf("Create(%q) = %+v created=%v, want the key round-tripped", key, record, created)
+		}
+		got, gerr := x.Get(ctx, id)
+		if gerr != nil || got.ID.StableKey != key {
+			t.Fatalf("Get(%q) = %+v (err %v), want the key round-tripped", key, got, gerr)
+		}
+	}
+
+	// The whole store is one directory and one log file. Anything else means a
+	// key component escaped into the filesystem.
+	var found []string
+	if err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		relative, rerr := filepath.Rel(root, path)
+		if rerr != nil {
+			return rerr
+		}
+		if relative != "." {
+			found = append(found, filepath.ToSlash(relative))
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("walk store root: %v", err)
+	}
+	want := []string{"ordered", "ordered/sessions.olog"}
+	if !equalStrings(found, want) {
+		t.Fatalf("store contains %v, want exactly %v", found, want)
+	}
+
+	// And a reopen still reads every hostile key back, so nothing was normalized
+	// on the way to the disk either.
+	reopened := openTestOrderedIndex(t, root)
+	for _, key := range hostile {
+		if got, gerr := reopened.Get(ctx, orderedID("host", key)); gerr != nil || got.ID.StableKey != key {
+			t.Fatalf("reopened Get(%q) = %+v (err %v)", key, got, gerr)
+		}
+	}
+}
+
+// TestOrderedIndexWarmPagesReadNoHistory is invariant 15's assertion, and the
+// reason catchUp exists at all. A warm reader must not re-read or re-decode the
+// prefix it has already applied: pages over a settled namespace must read ZERO
+// bytes, and a page taken after another writer appended one frame must read
+// exactly that frame — not the file.
+//
+// Rebuilding the view with replay per read would still return every correct
+// answer, so no other test in this file can fail on it. This one measures the
+// bytes.
+func TestOrderedIndexWarmPagesReadNoHistory(t *testing.T) {
+	t.Parallel()
+	x, root := newTestOrderedIndex(t)
+	ctx := context.Background()
+
+	const records = 60
+	for i := range records {
+		mustCreate(t, x, orderedID("host", storage.StableKey("k-"+strconv.Itoa(i))), ranked(int64(i)), dueAt(int64(i)))
+	}
+	log, err := x.store.logFor("sessions")
+	if err != nil {
+		t.Fatalf("logFor: %v", err)
+	}
+	logPath := filepath.Join(root, orderedDirName, "sessions"+orderedLogExt)
+	if size := fileSize(t, logPath); size == 0 {
+		t.Fatalf("log %q is empty after %d creates", logPath, records)
+	}
+
+	// A writer folds its own frames in as it appends them, so a settled writer is
+	// already caught up and has never had to read its own history back.
+	settled := log.stats()
+	if settled.ScannedBytes != 0 {
+		t.Fatalf("after %d creates the writer read back %d bytes of its own log, want 0",
+			records, settled.ScannedBytes)
+	}
+
+	// Twenty pages across all three views read nothing at all.
+	for range 5 {
+		mustListOrdered(t, x, "sessions", "host", 7)
+		mustListRanked(t, x, "sessions", "catalog", 7)
+		mustListDue(t, x, "sessions", records, 7)
+		if _, gerr := x.Get(ctx, orderedID("host", "k-3")); gerr != nil {
+			t.Fatalf("Get: %v", gerr)
+		}
+	}
+	warm := log.stats()
+	if warm.ScannedBytes != settled.ScannedBytes || warm.CatchUps != settled.CatchUps {
+		t.Fatalf("warm reads scanned %d bytes over %d catch-ups, want no change from %d/%d",
+			warm.ScannedBytes, warm.CatchUps, settled.ScannedBytes, settled.CatchUps)
+	}
+	if warm.AppliedFrames != records {
+		t.Fatalf("applied %d frames, want exactly the %d written", warm.AppliedFrames, records)
+	}
+
+	// A second handle appends one frame. The first handle's next page must read
+	// exactly that frame's bytes — not the whole log.
+	sizeBefore := fileSize(t, logPath)
+	other := openTestOrderedIndex(t, root)
+	mustCreate(t, other, orderedID("host", "appended-elsewhere"), ranked(1_000), dueAt(1))
+	frameSize := fileSize(t, logPath) - sizeBefore
+	if frameSize <= 0 || frameSize >= sizeBefore {
+		t.Fatalf("one appended frame changed the log by %d bytes (log was %d); the test needs a small tail", frameSize, sizeBefore)
+	}
+
+	page, err := x.ListRanked(ctx, "sessions", "catalog", "", 1)
+	if err != nil {
+		t.Fatalf("ListRanked after a foreign append: %v", err)
+	}
+	if got, want := keysOf(page.Records), []string{"host/appended-elsewhere"}; !equalStrings(got, want) {
+		t.Fatalf("ListRanked after a foreign append = %v, want %v", got, want)
+	}
+	caught := log.stats()
+	if delta := caught.ScannedBytes - warm.ScannedBytes; delta != frameSize {
+		t.Fatalf("catching up on one appended frame read %d bytes, want exactly the frame's %d "+
+			"(the whole log is %d bytes; reading it would be the unbounded scan invariant 15 forbids)",
+			delta, frameSize, sizeBefore+frameSize)
+	}
+	if delta := caught.AppliedFrames - warm.AppliedFrames; delta != 1 {
+		t.Fatalf("catching up applied %d frames, want exactly 1", delta)
+	}
+}
+
+// TestOrderedIndexRejectsInvalidIdentityUnwrapped pins the classification the
+// storage contract names, which is NOT the one the codec's shared validation
+// gate would produce. The codec returns *OrderedCodecError for caller garbage
+// and the same type wrapped in *OrderedLogCorruptError for disk damage, so a
+// public method that let the codec do its argument checking would report a bad
+// stable key as something a caller cannot distinguish from a damaged log. Every
+// public entry point therefore validates with storage.ValidateOrderedID first
+// and returns THAT error unwrapped.
+func TestOrderedIndexRejectsInvalidIdentityUnwrapped(t *testing.T) {
+	t.Parallel()
+	x, root := newTestOrderedIndex(t)
+	ctx := context.Background()
+
+	longKey := storage.StableKey(strings.Repeat("k", storage.MaxStableKeyBytes+1))
+	cases := []struct {
+		name string
+		id   storage.OrderedID
+		want any
+	}{
+		{"bad namespace", storage.OrderedID{Namespace: "../escape", OrderingScope: "host", StableKey: "k"}, new(*storage.InvalidNameError)},
+		{"empty namespace", storage.OrderedID{Namespace: "", OrderingScope: "host", StableKey: "k"}, new(*storage.InvalidNameError)},
+		{"bad ordering scope", storage.OrderedID{Namespace: "sessions", OrderingScope: "Host!", StableKey: "k"}, new(*storage.InvalidNameError)},
+		{"empty stable key", storage.OrderedID{Namespace: "sessions", OrderingScope: "host", StableKey: ""}, new(*storage.InvalidStableKeyError)},
+		{"oversize stable key", storage.OrderedID{Namespace: "sessions", OrderingScope: "host", StableKey: longKey}, new(*storage.InvalidStableKeyError)},
+		{"invalid utf-8 stable key", storage.OrderedID{Namespace: "sessions", OrderingScope: "host", StableKey: storage.StableKey([]byte{0xff, 0xfe})}, new(*storage.InvalidStableKeyError)},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			operations := map[string]func() error{
+				"Get": func() error {
+					_, err := x.Get(ctx, testCase.id)
+					return err
+				},
+				"Create": func() error {
+					_, _, err := x.Create(ctx, testCase.id, "catalog", nil, storage.Rank{}, storage.Due{})
+					return err
+				},
+				"Update": func() error {
+					_, err := x.Update(ctx, testCase.id, 1, nil, storage.Rank{}, storage.Due{})
+					return err
+				},
+				"Delete": func() error {
+					_, err := x.Delete(ctx, testCase.id, 1)
+					return err
+				},
+			}
+			for name, operation := range operations {
+				err := operation()
+				if err == nil {
+					t.Fatalf("%s: no error, want a validation failure", name)
+				}
+				switch want := testCase.want.(type) {
+				case **storage.InvalidNameError:
+					if !errors.As(err, want) {
+						t.Fatalf("%s: error = %#v, want *storage.InvalidNameError", name, err)
+					}
+				case **storage.InvalidStableKeyError:
+					if !errors.As(err, want) {
+						t.Fatalf("%s: error = %#v, want *storage.InvalidStableKeyError", name, err)
+					}
+				}
+				// The codec's internal fault types must not surface here: a
+				// caller cannot tell those apart from a damaged log.
+				var codecErr *OrderedCodecError
+				var corruptErr *OrderedLogCorruptError
+				if errors.As(err, &codecErr) || errors.As(err, &corruptErr) {
+					t.Fatalf("%s: error = %#v leaks an internal log/codec fault type", name, err)
+				}
+			}
+		})
+	}
+
+	// The gate is UP FRONT, not merely somewhere along the path: nothing was
+	// opened, created, or written for any of these calls. A backstop deeper in
+	// (storage.ValidateOrderedRecord, say) would return the same error but only
+	// after Create had already laid down a directory and an empty log for an
+	// identity that will never exist.
+	entries, err := os.ReadDir(filepath.Join(root, orderedDirName))
+	if err != nil {
+		t.Fatalf("read ordered dir: %v", err)
+	}
+	if len(entries) != 0 {
+		names := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			names = append(names, entry.Name())
+		}
+		t.Fatalf("rejected identities left %v on disk, want nothing", names)
+	}
+}
+
+// TestOrderedIndexRejectsInvalidListArguments covers the listing validators,
+// which have no OrderedID to validate but the same obligation to fail before
+// touching a log.
+func TestOrderedIndexRejectsInvalidListArguments(t *testing.T) {
+	t.Parallel()
+	x, root := newTestOrderedIndex(t)
+	ctx := context.Background()
+
+	var nameErr *storage.InvalidNameError
+	if _, err := x.ListOrdered(ctx, "../escape", "host", 0, 10); !errors.As(err, &nameErr) {
+		t.Fatalf("ListOrdered(bad namespace) = %v, want *InvalidNameError", err)
+	}
+	if _, err := x.ListOrdered(ctx, "sessions", "Bad Scope", 0, 10); !errors.As(err, &nameErr) {
+		t.Fatalf("ListOrdered(bad scope) = %v, want *InvalidNameError", err)
+	}
+	if _, err := x.ListRanked(ctx, "sessions", "Bad Scope", "", 10); !errors.As(err, &nameErr) {
+		t.Fatalf("ListRanked(bad scope) = %v, want *InvalidNameError", err)
+	}
+	if _, err := x.ListDue(ctx, "../escape", 0, "", 10); !errors.As(err, &nameErr) {
+		t.Fatalf("ListDue(bad namespace) = %v, want *InvalidNameError", err)
+	}
+
+	var limitErr *storage.InvalidOrderedLimitError
+	for _, limit := range []int{0, -1, storage.MaxOrderedPageLimit + 1} {
+		if _, err := x.ListOrdered(ctx, "sessions", "host", 0, limit); !errors.As(err, &limitErr) {
+			t.Fatalf("ListOrdered(limit %d) = %v, want *InvalidOrderedLimitError", limit, err)
+		}
+		if _, err := x.ListRanked(ctx, "sessions", "catalog", "", limit); !errors.As(err, &limitErr) {
+			t.Fatalf("ListRanked(limit %d) = %v, want *InvalidOrderedLimitError", limit, err)
+		}
+		if _, err := x.ListDue(ctx, "sessions", 0, "", limit); !errors.As(err, &limitErr) {
+			t.Fatalf("ListDue(limit %d) = %v, want *InvalidOrderedLimitError", limit, err)
+		}
+	}
+
+	// A rejected read, and a successful read of a namespace that was never
+	// written, both leave the store empty: a listing never creates a log file.
+	if entries, err := os.ReadDir(filepath.Join(root, orderedDirName)); err != nil || len(entries) != 0 {
+		t.Fatalf("ordered dir = %v (err %v), want empty after reads only", entries, err)
+	}
+	if page, err := x.ListOrdered(ctx, "untouched", "host", 0, 10); err != nil || len(page.Records) != 0 {
+		t.Fatalf("ListOrdered(untouched) = %+v (err %v), want an empty page", page, err)
+	}
+	if entries, err := os.ReadDir(filepath.Join(root, orderedDirName)); err != nil || len(entries) != 0 {
+		t.Fatalf("reading an untouched namespace created %v (err %v), want nothing", entries, err)
+	}
+}
+
+// TestOrderedIndexInconsistentLogFailsClosed proves the fold is validated rather
+// than trusted. A frame whose framing and payload are both perfectly valid can
+// still contradict the state it applies to — an update for an identity that was
+// never created, a second create for one that was, a mutation of a tombstone, or
+// a revision that skips. None is reachable through this package's writers, so
+// only a foreign or hand-edited log produces one; applying it anyway would leave
+// the in-memory indexes quietly wrong instead of erroring.
+func TestOrderedIndexInconsistentLogFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	// Each case writes frames DIRECTLY through the log, bypassing the index, and
+	// then asks a cold index to read the namespace back.
+	cases := []struct {
+		name   string
+		frames []orderedMutation
+	}{
+		{
+			name:   "update without a create",
+			frames: []orderedMutation{updateMutation("host", "ghost", 2, 1)},
+		},
+		{
+			name: "create over an existing identity",
+			frames: []orderedMutation{
+				createMutation("host", "dup", 1),
+				createMutation("host", "dup", 2),
+			},
+		},
+		{
+			name: "order that does not increase",
+			frames: []orderedMutation{
+				createMutation("host", "first", 5),
+				createMutation("host", "second", 5),
+			},
+		},
+		{
+			name: "revision that skips",
+			frames: []orderedMutation{
+				createMutation("host", "skipped", 1),
+				updateMutation("host", "skipped", 3, 1),
+			},
+		},
+		{
+			name: "mutation after a tombstone",
+			frames: []orderedMutation{
+				createMutation("host", "gone", 1),
+				deleteMutation("host", "gone", 2, 1),
+				updateMutation("host", "gone", 3, 1),
+			},
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			store, root := newTestOrderedLogStore(t)
+			log, err := store.logFor("sessions")
+			if err != nil {
+				t.Fatalf("logFor: %v", err)
+			}
+			for _, frame := range testCase.frames {
+				mustAppend(t, log, frame)
+			}
+
+			index := openTestOrderedIndex(t, root)
+			_, gerr := index.ListOrdered(context.Background(), "sessions", "host", 0, 10)
+			var corrupt *OrderedLogCorruptError
+			if !errors.As(gerr, &corrupt) {
+				t.Fatalf("ListOrdered over a contradictory log = %v, want *OrderedLogCorruptError", gerr)
+			}
+			if !errors.Is(gerr, errOrderedInconsistentLog) {
+				t.Fatalf("corrupt error %v does not unwrap to errOrderedInconsistentLog", gerr)
+			}
+			// The failure is sticky, not a one-off: a second read must not serve
+			// a half-applied view.
+			if _, again := index.ListOrdered(context.Background(), "sessions", "host", 0, 10); !errors.As(again, &corrupt) {
+				t.Fatalf("second read after corruption = %v, want the same failure", again)
+			}
+		})
+	}
+}
+
+// updateMutation builds an update frame for an identity at the given revision.
+func updateMutation(scope string, key storage.StableKey, revision, order uint64) orderedMutation {
+	m := createMutation(scope, key, order)
+	m.Op = orderedOpUpdate
+	m.Revision = revision
+	return m
+}
+
+// deleteMutation builds a tombstone frame, which the codec requires to be
+// unranked and not due.
+func deleteMutation(scope string, key storage.StableKey, revision, order uint64) orderedMutation {
+	m := updateMutation(scope, key, revision, order)
+	m.Op = orderedOpDelete
+	m.Rank = storage.Rank{}
+	m.Due = storage.Due{}
+	return m
+}
+
+// TestOrderedIndexRecordsAreCallerOwned pins the contract's slice-ownership
+// rule in both directions: a caller mutating the slice it passed in must not
+// change stored state, and a caller mutating a slice it was handed must not
+// change what the next reader sees.
+func TestOrderedIndexRecordsAreCallerOwned(t *testing.T) {
+	t.Parallel()
+	x, _ := newTestOrderedIndex(t)
+	ctx := context.Background()
+	id := orderedID("host", "owned")
+
+	value := []byte("original")
+	created, _, err := x.Create(ctx, id, "catalog", value, ranked(1), dueAt(1))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	copy(value, "clobbered")
+	copy(created.Value, "vandalism")
+
+	got, err := x.Get(ctx, id)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !bytes.Equal(got.Value, []byte("original")) {
+		t.Fatalf("Get returned %q, want %q: the store retained a caller slice", got.Value, "original")
+	}
+	copy(got.Value, "again!!!")
+
+	page, err := x.ListRanked(ctx, "sessions", "catalog", "", 10)
+	if err != nil {
+		t.Fatalf("ListRanked: %v", err)
+	}
+	if len(page.Records) != 1 || !bytes.Equal(page.Records[0].Value, []byte("original")) {
+		t.Fatalf("ListRanked returned %q, want %q: a returned slice aliased the index",
+			page.Records[0].Value, "original")
+	}
+	// A nil value stays nil rather than becoming an empty slice.
+	nilID := orderedID("host", "nil-value")
+	if record, _, cerr := x.Create(ctx, nilID, "catalog", nil, storage.Rank{}, storage.Due{}); cerr != nil || record.Value != nil {
+		t.Fatalf("Create(nil value) = %+v (err %v), want a nil Value", record, cerr)
+	}
+	if record, gerr := x.Get(ctx, nilID); gerr != nil || record.Value != nil {
+		t.Fatalf("Get(nil value) = %+v (err %v), want a nil Value", record, gerr)
+	}
+}
+
+// TestOrderedIndexUnrankedRankIsCanonical pins a subtle reopen hazard. storage
+// permits a caller to pass Rank{Ranked: false, Value: 7} and a backend may not
+// be stricter than the contract — but the wire format has exactly one spelling
+// for "unranked", so the value published in memory has to be the one that
+// survives a restart or the record silently changes under a reopen.
+func TestOrderedIndexUnrankedRankIsCanonical(t *testing.T) {
+	t.Parallel()
+	x, root := newTestOrderedIndex(t)
+	ctx := context.Background()
+	id := orderedID("host", "unranked")
+
+	created, _, err := x.Create(ctx, id, "catalog", nil, storage.Rank{Ranked: false, Value: 7}, storage.Due{})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if created.Rank != (storage.Rank{}) {
+		t.Fatalf("Create published rank %+v, want the canonical zero Rank", created.Rank)
+	}
+	updated, err := x.Update(ctx, id, created.Revision, nil, storage.Rank{Ranked: false, Value: -3}, storage.Due{})
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if updated.Rank != (storage.Rank{}) {
+		t.Fatalf("Update published rank %+v, want the canonical zero Rank", updated.Rank)
+	}
+
+	reopened := openTestOrderedIndex(t, root)
+	got, err := reopened.Get(ctx, id)
+	if err != nil {
+		t.Fatalf("reopened Get: %v", err)
+	}
+	if got.Rank != updated.Rank {
+		t.Fatalf("reopened rank %+v != in-memory rank %+v: the record changed under a restart", got.Rank, updated.Rank)
+	}
+}
+
+// TestOrderedIndexPaginationOverAMovedRecord documents, rather than forbids,
+// the weak consistency the contract allows: the cursor names a frozen position,
+// not a snapshot, so a record whose rank moves across that position between two
+// pages is skipped or repeated. This test pins the SKIP, because a provider that
+// silently "fixed" it would be holding a snapshot — which is the unbounded
+// per-page work invariant 15 forbids. Clients reconcile by stable identity.
+func TestOrderedIndexPaginationOverAMovedRecord(t *testing.T) {
+	t.Parallel()
+	x, _ := newTestOrderedIndex(t)
+	ctx := context.Background()
+
+	mustCreate(t, x, orderedID("host", "high"), ranked(30), storage.Due{})
+	middle := mustCreate(t, x, orderedID("host", "middle"), ranked(20), storage.Due{})
+	mustCreate(t, x, orderedID("host", "low"), ranked(10), storage.Due{})
+
+	first, err := x.ListRanked(ctx, "sessions", "catalog", "", 1)
+	if err != nil || len(first.Records) != 1 || first.Records[0].ID.StableKey != "high" {
+		t.Fatalf("page 1 = %+v (err %v), want [high]", keysOf(first.Records), err)
+	}
+	// Move "middle" ABOVE the frozen cursor position while the caller pages.
+	if _, uerr := x.Update(ctx, middle.ID, middle.Revision, nil, ranked(99), storage.Due{}); uerr != nil {
+		t.Fatalf("Update(middle): %v", uerr)
+	}
+	second, err := x.ListRanked(ctx, "sessions", "catalog", first.NextCursor, 10)
+	if err != nil {
+		t.Fatalf("page 2: %v", err)
+	}
+	if got, want := keysOf(second.Records), []string{"host/low"}; !equalStrings(got, want) {
+		t.Fatalf("page 2 = %v, want %v: a record that moved behind the frozen cursor is skipped", got, want)
+	}
+	// It is still there — the caller just has to reconcile by identity.
+	whole, _ := mustListRanked(t, x, "sessions", "catalog", 10)
+	if got, want := keysOf(whole), []string{"host/middle", "host/high", "host/low"}; !equalStrings(got, want) {
+		t.Fatalf("full listing = %v, want %v", got, want)
+	}
+}
+
+// TestOrderedIndexNamespacesAreIndependent checks that identity really is
+// (namespace, ordering_scope, stable_key): the same scope and key in two
+// namespaces are two records, in two logs, with two independent order scopes.
+func TestOrderedIndexNamespacesAreIndependent(t *testing.T) {
+	t.Parallel()
+	x, root := newTestOrderedIndex(t)
+	ctx := context.Background()
+
+	left := storage.OrderedID{Namespace: "sessions", OrderingScope: "host", StableKey: "shared"}
+	right := storage.OrderedID{Namespace: "factory/hosts", OrderingScope: "host", StableKey: "shared"}
+
+	leftRecord, _, err := x.Create(ctx, left, "catalog", []byte("left"), ranked(1), dueAt(1))
+	if err != nil {
+		t.Fatalf("Create(left): %v", err)
+	}
+	rightRecord, created, err := x.Create(ctx, right, "catalog", []byte("right"), ranked(2), dueAt(2))
+	if err != nil || !created {
+		t.Fatalf("Create(right) = %+v created=%v err=%v, want a fresh record", rightRecord, created, err)
+	}
+	if !bytes.Equal(rightRecord.Value, []byte("right")) {
+		t.Fatalf("the two namespaces collided: %+v", rightRecord)
+	}
+	// Order scopes are per (namespace, ordering scope), so both take order 1.
+	if leftRecord.Order != 1 || rightRecord.Order != 1 {
+		t.Fatalf("orders = %d and %d, want each scope to start independently", leftRecord.Order, rightRecord.Order)
+	}
+	// The due view is per namespace and does not leak across.
+	dueLeft, _ := mustListDue(t, x, "sessions", 10, 10)
+	if got, want := keysOf(dueLeft), []string{"host/shared"}; !equalStrings(got, want) || len(dueLeft) != 1 {
+		t.Fatalf("ListDue(sessions) = %v, want exactly %v", got, want)
+	}
+	// A nested namespace becomes nested directories, and only the namespace does.
+	nested := filepath.Join(root, orderedDirName, "factory", "hosts"+orderedLogExt)
+	if _, serr := os.Stat(nested); serr != nil {
+		t.Fatalf("stat %q: %v", nested, serr)
+	}
+}
+
+// TestOrderedIndexCreateReportsACommittedFrameOnAFsyncFailure pins the one
+// error case a caller must NOT read as "nothing happened". The frame is written
+// and fsynced before the ancestor directory chain is made durable, so a failure
+// in that last step leaves the create COMMITTED. Returning a zero record
+// alongside the error would invite a retry that burned a second order for one
+// identity; Create therefore returns the record it committed, and the retry
+// takes the duplicate path.
+func TestOrderedIndexCreateReportsACommittedFrameOnAFsyncFailure(t *testing.T) {
+	t.Parallel()
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: directory permissions are not enforced")
+	}
+	x, root := newTestOrderedIndex(t)
+	ctx := context.Background()
+
+	// A nested namespace, so the log lives one directory below <root>/ordered
+	// and that directory's permissions can be adjusted independently.
+	id := storage.OrderedID{Namespace: "factory/hosts", OrderingScope: "host", StableKey: "alpha"}
+	leafDir := filepath.Join(root, orderedDirName, "factory")
+	if merr := os.MkdirAll(leafDir, 0o700); merr != nil {
+		t.Fatalf("mkdir %s: %v", leafDir, merr)
+	}
+	t.Cleanup(func() { _ = os.Chmod(leafDir, 0o700) })
+
+	// Write+traverse only: the log can be created and written inside, but the
+	// directory itself cannot be opened for the fsync.
+	if cerr := os.Chmod(leafDir, 0o300); cerr != nil {
+		t.Fatalf("chmod: %v", cerr)
+	}
+	record, created, err := x.Create(ctx, id, "catalog", []byte("committed"), ranked(5), dueAt(50))
+	if err == nil {
+		t.Fatalf("Create succeeded despite an unopenable directory: %+v", record)
+	}
+	var ioErr *OrderedLogIOError
+	if !errors.As(err, &ioErr) || ioErr.Op != "open-dir" {
+		t.Fatalf("Create error = %T %v, want an *OrderedLogIOError with op open-dir", err, err)
+	}
+	if !created || record.Order == 0 {
+		t.Fatalf("Create returned created=%v order=%d with the error; the frame IS committed, "+
+			"so erasing it would invite a retry that burns a second order", created, record.Order)
+	}
+	if record.Revision != 1 || !bytes.Equal(record.Value, []byte("committed")) {
+		t.Fatalf("committed record = %+v, want the create candidate", record)
+	}
+
+	if cerr := os.Chmod(leafDir, 0o700); cerr != nil {
+		t.Fatalf("chmod back: %v", cerr)
+	}
+	// The retry is answered by the duplicate path, with the SAME order.
+	retried, retriedCreated, rerr := x.Create(ctx, id, "catalog", []byte("second attempt"), ranked(9), dueAt(90))
+	if rerr != nil {
+		t.Fatalf("Create retry: %v", rerr)
+	}
+	if retriedCreated {
+		t.Fatal("Create retry reported created=true: the first attempt's frame was committed")
+	}
+	if retried.Order != record.Order || retried.Revision != 1 || !bytes.Equal(retried.Value, []byte("committed")) {
+		t.Fatalf("Create retry = %+v, want the originally committed %+v", retried, record)
+	}
+	// And a cold handle reads the same thing off the disk, so the frame really
+	// was durable and not merely remembered.
+	if got, gerr := openTestOrderedIndex(t, root).Get(ctx, id); gerr != nil || got.Order != record.Order {
+		t.Fatalf("cold Get = %+v (err %v), want the committed record %+v", got, gerr, record)
+	}
+}
+
+// TestOrderedIndexDuplicateCreateIgnoresTheCandidate pins the ordering that
+// makes Create genuinely idempotent: the duplicate lookup happens BEFORE the
+// candidate is validated. Validating first would look harmless and quietly break
+// the one case idempotency exists for — a retry after an unknown outcome, which
+// may well carry a candidate the caller has since changed or a ranking scope a
+// newer build no longer considers valid. Such a retry must still be answered
+// with the record that exists.
+func TestOrderedIndexDuplicateCreateIgnoresTheCandidate(t *testing.T) {
+	t.Parallel()
+	x, _ := newTestOrderedIndex(t)
+	ctx := context.Background()
+	id := orderedID("host", "idempotent")
+
+	original := mustCreate(t, x, id, ranked(3), dueAt(30))
+
+	// Every candidate field below is invalid on its own terms: an unusable
+	// ranking scope, an oversize value, and a due state whose non-due form
+	// carries a nonzero timestamp.
+	oversize := make([]byte, storage.MaxOrderedValueBytes+1)
+	duplicate, created, err := x.Create(ctx, id, "Not A Valid Scope!", oversize,
+		ranked(99), storage.Due{State: storage.NotDue, UnixMillis: 5})
+	if err != nil {
+		t.Fatalf("duplicate Create with an invalid candidate = %v, want the original record", err)
+	}
+	if created {
+		t.Fatal("duplicate Create reported created=true")
+	}
+	if duplicate.Order != original.Order || duplicate.Revision != original.Revision ||
+		duplicate.Rank != original.Rank || duplicate.Due != original.Due ||
+		duplicate.RankingScope != original.RankingScope || !bytes.Equal(duplicate.Value, original.Value) {
+		t.Fatalf("duplicate Create returned %+v, want the original %+v", duplicate, original)
+	}
+	// And the stored record is untouched.
+	if got, gerr := x.Get(ctx, id); gerr != nil || got.RankingScope != original.RankingScope ||
+		!bytes.Equal(got.Value, original.Value) {
+		t.Fatalf("after a duplicate Create, Get = %+v (err %v), want %+v", got, gerr, original)
+	}
+
+	// A tombstone is a duplicate too, on the same terms.
+	victim := mustCreate(t, x, orderedID("host", "tombstoned"), ranked(1), dueAt(1))
+	tombstone, err := x.Delete(ctx, victim.ID, victim.Revision)
+	if err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	again, created, err := x.Create(ctx, victim.ID, "Not A Valid Scope!", oversize, ranked(99), storage.Due{})
+	if err != nil || created {
+		t.Fatalf("Create over a tombstone = created=%v err=%v, want the tombstone", created, err)
+	}
+	if again.Revision != tombstone.Revision || !again.Deleted {
+		t.Fatalf("Create over a tombstone returned %+v, want %+v", again, tombstone)
+	}
+}
