@@ -1098,6 +1098,11 @@ func TestOrderedErrorMessages(t *testing.T) {
 			contains: []string{"ordered namespace", "../escape", "maps outside"},
 		},
 		{
+			name:     "closed store",
+			err:      &OrderedLogClosedError{Root: "/s", Namespace: "sessions"},
+			contains: []string{"ordered log store", "is closed", "sessions"},
+		},
+		{
 			name:     "unusable root",
 			err:      &OrderedLogRootError{Root: "  ", Reason: "empty root"},
 			contains: []string{"invalid ordered log root", "empty root"},
