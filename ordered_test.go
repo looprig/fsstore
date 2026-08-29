@@ -1883,12 +1883,20 @@ func TestOrderedIndexReopenRestoresViews(t *testing.T) {
 }
 
 // TestOrderedIndexTwoHandlesCreateOnce drives concurrent creates from two
-// INDEPENDENT handles on one root. The handles share no mutex and no view, so
-// the only thing that can stop both from finding the identity absent and both
-// allocating an order is the exclusive advisory lock held across catch-up,
-// decision, and append. Exactly one create must win, every caller must be told
-// the same record, and the distinct identities created alongside must all get
-// distinct orders.
+// INDEPENDENT handles on one root. The handles share no store mutex and no view,
+// so within this one process the ONLY thing that can stop both from finding the
+// identity absent, both allocating an order, and both writing a frame at the
+// offset each believes is the end of the file is the exclusive advisory lock
+// held across catch-up, decision, and append. Exactly one create must win, every
+// caller must be told the same record, and every distinct identity created
+// alongside must get its own order and survive on the disk.
+//
+// The contention has to be real for any of that to be tested, which takes three
+// things a weaker version of this test got wrong: every racer starts from a
+// barrier rather than trickling in behind the goroutines before it; each does
+// enough work that the window is wide; and NONE of the store calls happens
+// inside the test's own bookkeeping mutex, which would serialize the very races
+// it is trying to provoke.
 func TestOrderedIndexTwoHandlesCreateOnce(t *testing.T) {
 	t.Parallel()
 	_, root := newTestOrderedIndex(t)
@@ -1896,7 +1904,10 @@ func TestOrderedIndexTwoHandlesCreateOnce(t *testing.T) {
 	right := openTestOrderedIndex(t, root)
 	ctx := context.Background()
 
-	const racers = 8
+	const (
+		racers   = 16
+		perRacer = 4
+	)
 	contested := orderedID("host", "contested")
 
 	var (
@@ -1905,6 +1916,7 @@ func TestOrderedIndexTwoHandlesCreateOnce(t *testing.T) {
 		observed []storage.OrderedRecord
 		wg       sync.WaitGroup
 	)
+	start := make(chan struct{})
 	for i := range racers {
 		handle := left
 		if i%2 == 1 {
@@ -1913,10 +1925,21 @@ func TestOrderedIndexTwoHandlesCreateOnce(t *testing.T) {
 		wg.Add(1)
 		go func(handle *orderedIndex, i int) {
 			defer wg.Done()
+			<-start
 			// Every racer proposes a DIFFERENT value, so a second winner would be
 			// visible as a changed record rather than hidden by identical inputs.
 			record, created, err := handle.Create(ctx, contested, "catalog",
 				[]byte("racer-"+strconv.Itoa(i)), ranked(int64(i)), dueAt(int64(i)))
+			// Distinct identities alongside the contested one, to prove order
+			// allocation stays unique and no frame is clobbered under the same
+			// contention. These run OUTSIDE the bookkeeping mutex on purpose.
+			for j := range perRacer {
+				key := storage.StableKey("solo-" + strconv.Itoa(i) + "-" + strconv.Itoa(j))
+				if _, _, uerr := handle.Create(ctx, orderedID("host", key),
+					"catalog", nil, storage.Rank{}, storage.Due{}); uerr != nil {
+					t.Errorf("racer %d solo Create %d: %v", i, j, uerr)
+				}
+			}
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
@@ -1927,14 +1950,9 @@ func TestOrderedIndexTwoHandlesCreateOnce(t *testing.T) {
 				wins++
 			}
 			observed = append(observed, record)
-			// A distinct identity per racer, to prove order allocation stays
-			// unique under the same contention.
-			if _, _, uerr := handle.Create(ctx, orderedID("host", storage.StableKey("solo-"+strconv.Itoa(i))),
-				"catalog", nil, storage.Rank{}, storage.Due{}); uerr != nil {
-				t.Errorf("racer %d solo Create: %v", i, uerr)
-			}
 		}(handle, i)
 	}
+	close(start)
 	wg.Wait()
 
 	if wins != 1 {
@@ -1949,9 +1967,9 @@ func TestOrderedIndexTwoHandlesCreateOnce(t *testing.T) {
 	// Every create is on the disk exactly once, with a unique, strictly
 	// increasing order — read back through a THIRD cold handle so the assertion
 	// is about the log, not about either writer's memory.
-	stream := mustListOrdered(t, openTestOrderedIndex(t, root), "sessions", "host", 100)
-	if len(stream) != racers+1 {
-		t.Fatalf("ListOrdered returned %d records, want %d", len(stream), racers+1)
+	stream := mustListOrdered(t, openTestOrderedIndex(t, root), "sessions", "host", 1000)
+	if want := racers*perRacer + 1; len(stream) != want {
+		t.Fatalf("ListOrdered returned %d records, want %d (a lost frame means the flock did not serialize)", len(stream), want)
 	}
 	seen := make(map[uint64]bool, len(stream))
 	var previous uint64
@@ -2547,6 +2565,9 @@ func TestOrderedIndexRejectsInvalidListArguments(t *testing.T) {
 	if _, err := x.ListOrdered(ctx, "sessions", "Bad Scope", 0, 10); !errors.As(err, &nameErr) {
 		t.Fatalf("ListOrdered(bad scope) = %v, want *InvalidNameError", err)
 	}
+	if _, err := x.ListRanked(ctx, "../escape", "catalog", "", 10); !errors.As(err, &nameErr) {
+		t.Fatalf("ListRanked(bad namespace) = %v, want *InvalidNameError", err)
+	}
 	if _, err := x.ListRanked(ctx, "sessions", "Bad Scope", "", 10); !errors.As(err, &nameErr) {
 		t.Fatalf("ListRanked(bad scope) = %v, want *InvalidNameError", err)
 	}
@@ -2578,6 +2599,135 @@ func TestOrderedIndexRejectsInvalidListArguments(t *testing.T) {
 	if entries, err := os.ReadDir(filepath.Join(root, orderedDirName)); err != nil || len(entries) != 0 {
 		t.Fatalf("reading an untouched namespace created %v (err %v), want nothing", entries, err)
 	}
+}
+
+// TestOrderedIndexValidatesArgumentsBeforeTheStore makes the up-front validation
+// gates OBSERVABLE, which they otherwise are not.
+//
+// logFor validates the namespace itself and returns the identical
+// *storage.InvalidNameError, so on a healthy store deleting
+// storage.ValidateName(namespace) from a listing, or storage.ValidateOrderedID
+// from a public method, changes nothing any "bad namespace" case can see: the
+// same error still arrives, from one frame deeper. The gates are not redundant
+// though, and this test pins the two things that make them load-bearing.
+//
+// First, ORDER. A caller error is classified by the argument the method
+// validates first, not by whichever check happens to be reached. Without the
+// namespace gate a listing with a bad namespace AND a bad limit reports the
+// limit, and one with a bad namespace and a cursor bound to a different
+// namespace reports a query mismatch — telling the caller their cursor is stale
+// when in fact their namespace is unusable.
+//
+// Second, PRECEDENCE OVER STORE STATE. logFor's namespace check runs before its
+// closed check, but nothing else does: on a closed store an unvalidated ordering
+// scope or stable key would come back as *OrderedLogClosedError, so a caller
+// would be told the store is shut when what is actually wrong is their argument.
+func TestOrderedIndexValidatesArgumentsBeforeTheStore(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	t.Run("the namespace is classified before the limit and the cursor", func(t *testing.T) {
+		t.Parallel()
+		x, _ := newTestOrderedIndex(t)
+		mustCreate(t, x, orderedID("host", "one"), ranked(2), dueAt(10))
+		mustCreate(t, x, orderedID("host", "two"), ranked(1), dueAt(20))
+		rankedPage, err := x.ListRanked(ctx, "sessions", "catalog", "", 1)
+		if err != nil || rankedPage.NextCursor == "" {
+			t.Fatalf("ListRanked page 1 = %+v (err %v), want a continuation cursor", rankedPage, err)
+		}
+		duePage, err := x.ListDue(ctx, "sessions", 100, "", 1)
+		if err != nil || duePage.NextCursor == "" {
+			t.Fatalf("ListDue page 1 = %+v (err %v), want a continuation cursor", duePage, err)
+		}
+
+		var nameErr *storage.InvalidNameError
+		cases := map[string]func() error{
+			"ListOrdered, bad namespace and a bad limit": func() error {
+				_, err := x.ListOrdered(ctx, "../escape", "host", 0, 0)
+				return err
+			},
+			"ListRanked, bad namespace and a bad limit": func() error {
+				_, err := x.ListRanked(ctx, "../escape", "catalog", "", 0)
+				return err
+			},
+			"ListDue, bad namespace and a bad limit": func() error {
+				_, err := x.ListDue(ctx, "../escape", 0, "", 0)
+				return err
+			},
+			"ListRanked, bad namespace and a foreign cursor": func() error {
+				_, err := x.ListRanked(ctx, "../escape", "catalog", rankedPage.NextCursor, 10)
+				return err
+			},
+			"ListDue, bad namespace and a foreign cursor": func() error {
+				_, err := x.ListDue(ctx, "../escape", 100, duePage.NextCursor, 10)
+				return err
+			},
+		}
+		for name, call := range cases {
+			if err := call(); !errors.As(err, &nameErr) {
+				t.Errorf("%s = %#v, want *storage.InvalidNameError", name, err)
+			}
+		}
+	})
+
+	t.Run("an argument is classified before the store's own state", func(t *testing.T) {
+		t.Parallel()
+		x, _ := newTestOrderedIndex(t)
+		if err := x.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		// The store really is shut, so a well-formed call reports that.
+		var closedErr *OrderedLogClosedError
+		if _, err := x.Get(ctx, orderedID("host", "fine")); !errors.As(err, &closedErr) {
+			t.Fatalf("Get on a closed store with a valid id = %#v, want *OrderedLogClosedError", err)
+		}
+		if _, err := x.ListOrdered(ctx, "sessions", "host", 0, 10); !errors.As(err, &closedErr) {
+			t.Fatalf("ListOrdered on a closed store = %#v, want *OrderedLogClosedError", err)
+		}
+
+		badScope := storage.OrderedID{Namespace: "sessions", OrderingScope: "Host!", StableKey: "k"}
+		badKey := storage.OrderedID{Namespace: "sessions", OrderingScope: "host", StableKey: ""}
+		methods := map[string]func(storage.OrderedID) error{
+			"Get": func(id storage.OrderedID) error {
+				_, err := x.Get(ctx, id)
+				return err
+			},
+			"Create": func(id storage.OrderedID) error {
+				_, _, err := x.Create(ctx, id, "catalog", nil, storage.Rank{}, storage.Due{})
+				return err
+			},
+			"Update": func(id storage.OrderedID) error {
+				_, err := x.Update(ctx, id, 1, nil, storage.Rank{}, storage.Due{})
+				return err
+			},
+			"Delete": func(id storage.OrderedID) error {
+				_, err := x.Delete(ctx, id, 1)
+				return err
+			},
+		}
+		for name, call := range methods {
+			var nameErr *storage.InvalidNameError
+			if err := call(badScope); !errors.As(err, &nameErr) {
+				t.Errorf("%s(bad ordering scope) on a closed store = %#v, want *storage.InvalidNameError", name, err)
+			}
+			var keyErr *storage.InvalidStableKeyError
+			if err := call(badKey); !errors.As(err, &keyErr) {
+				t.Errorf("%s(bad stable key) on a closed store = %#v, want *storage.InvalidStableKeyError", name, err)
+			}
+		}
+		// The listings' scope and limit gates answer before the closed store too.
+		var nameErr *storage.InvalidNameError
+		if _, err := x.ListOrdered(ctx, "sessions", "Bad Scope", 0, 10); !errors.As(err, &nameErr) {
+			t.Errorf("ListOrdered(bad scope) on a closed store = %#v, want *storage.InvalidNameError", err)
+		}
+		if _, err := x.ListRanked(ctx, "sessions", "Bad Scope", "", 10); !errors.As(err, &nameErr) {
+			t.Errorf("ListRanked(bad scope) on a closed store = %#v, want *storage.InvalidNameError", err)
+		}
+		var limitErr *storage.InvalidOrderedLimitError
+		if _, err := x.ListDue(ctx, "sessions", 0, "", 0); !errors.As(err, &limitErr) {
+			t.Errorf("ListDue(bad limit) on a closed store = %#v, want *storage.InvalidOrderedLimitError", err)
+		}
+	})
 }
 
 // TestOrderedIndexInconsistentLogFailsClosed proves the fold is validated rather
@@ -2707,6 +2857,21 @@ func TestOrderedIndexRecordsAreCallerOwned(t *testing.T) {
 	if len(page.Records) != 1 || !bytes.Equal(page.Records[0].Value, []byte("original")) {
 		t.Fatalf("ListRanked returned %q, want %q: a returned slice aliased the index",
 			page.Records[0].Value, "original")
+	}
+	// Clobber the LISTING's slice, not Get's. Mutating a record Get already
+	// cloned proves nothing about collect, which is the function all three
+	// listings hand their records out through.
+	copy(page.Records[0].Value, "listwreck")
+	again, err := x.ListRanked(ctx, "sessions", "catalog", "", 10)
+	if err != nil {
+		t.Fatalf("ListRanked (second): %v", err)
+	}
+	if len(again.Records) != 1 || !bytes.Equal(again.Records[0].Value, []byte("original")) {
+		t.Fatalf("ListRanked after a caller mutated its page = %q, want %q: collect handed out the index's own slice",
+			again.Records[0].Value, "original")
+	}
+	if record, gerr := x.Get(ctx, id); gerr != nil || !bytes.Equal(record.Value, []byte("original")) {
+		t.Fatalf("Get after a caller mutated a listing = %q (err %v), want %q", record.Value, gerr, "original")
 	}
 	// A nil value stays nil rather than becoming an empty slice.
 	nilID := orderedID("host", "nil-value")
