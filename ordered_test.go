@@ -5,11 +5,13 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/looprig/storage"
 )
@@ -607,10 +609,15 @@ func TestOrderedCorruptionFailsClosed(t *testing.T) {
 }
 
 // TestOrderedLogWarmAppendRescansAfterExternalWrite proves the cached tip/size
-// is not trusted blindly. A second writer (another process holding the advisory
-// lock) extends the log; the first writer's next append must notice the file
-// grew, re-scan, and continue AFTER the new frame rather than overwrite it. A
-// cache that skipped the re-scan would silently clobber a committed mutation.
+// is not trusted blindly: the log is extended behind the warm writer's back, and
+// its next append must notice the file grew, re-scan, and continue AFTER the new
+// frame rather than overwrite it. A cache that skipped the re-scan would
+// silently clobber a committed mutation.
+//
+// The external frame is written directly, with no lock contention: this test
+// covers the CACHE, not the advisory lock. Cross-process locking is pinned by
+// TestOrderedAppendBlocksOnAForeignLock and
+// TestOrderedLogCrossProcessAppendsSerialize.
 func TestOrderedLogWarmAppendRescansAfterExternalWrite(t *testing.T) {
 	t.Parallel()
 	store, root := newTestOrderedLogStore(t)
@@ -817,4 +824,228 @@ func flipByte(t *testing.T, path string, off int) {
 	}
 	data[off] ^= 0xFF
 	writeFile(t, path, data)
+}
+
+// --- cross-process advisory locking ---------------------------------------
+//
+// The flock in append/replay is the only thing standing between two PROCESSES
+// and a clobbered log: the in-process mutex is per-*orderedLog, and a second
+// process has its own. Both tests below fail if lockFileEx is removed from
+// append — the first deterministically (the append proceeds while a foreign
+// lock is held), the second by losing committed frames.
+
+// orderedChildRootEnv, when set, makes the test binary run as an APPENDING CHILD
+// PROCESS instead of a test suite: TestMain dispatches on it before m.Run.
+const (
+	orderedChildRootEnv  = "FSSTORE_ORDERED_CHILD_ROOT"
+	orderedChildKeyEnv   = "FSSTORE_ORDERED_CHILD_KEY"
+	orderedChildCountEnv = "FSSTORE_ORDERED_CHILD_COUNT"
+)
+
+// orderedChildNamespace is the namespace both the parent and every child append
+// to in TestOrderedLogCrossProcessAppendsSerialize.
+const orderedChildNamespace = "sessions"
+
+func TestMain(m *testing.M) {
+	if root := os.Getenv(orderedChildRootEnv); root != "" {
+		os.Exit(runOrderedAppendChild(root, os.Getenv(orderedChildKeyEnv), os.Getenv(orderedChildCountEnv)))
+	}
+	os.Exit(m.Run())
+}
+
+// runOrderedAppendChild appends count mutations to root's ordered log as a
+// SEPARATE PROCESS, so only the advisory lock can serialize it against its
+// siblings and the parent. It returns the process exit code.
+func runOrderedAppendChild(root, keyPrefix, count string) int {
+	n, err := strconv.Atoi(count)
+	if err != nil {
+		os.Stderr.WriteString("child: bad count: " + err.Error() + "\n")
+		return 2
+	}
+	store, serr := newOrderedLogStore(root)
+	if serr != nil {
+		os.Stderr.WriteString("child: open store: " + serr.Error() + "\n")
+		return 2
+	}
+	defer func() { _ = store.Close() }()
+	log, lerr := store.logFor(orderedChildNamespace)
+	if lerr != nil {
+		os.Stderr.WriteString("child: logFor: " + lerr.Error() + "\n")
+		return 2
+	}
+	for i := range n {
+		key := storage.StableKey(keyPrefix + "-" + strconv.Itoa(i))
+		if _, aerr := log.append(createMutation("host", key, uint64(i+1))); aerr != nil {
+			os.Stderr.WriteString("child: append: " + aerr.Error() + "\n")
+			return 2
+		}
+	}
+	return 0
+}
+
+// TestOrderedAppendBlocksOnAForeignLock proves append actually TAKES the
+// cross-process lock rather than merely relying on the in-process mutex: while
+// another open file description holds LOCK_EX on the log, the append must not
+// proceed, and it must complete once that lock is released.
+func TestOrderedAppendBlocksOnAForeignLock(t *testing.T) {
+	t.Parallel()
+	store, root := newTestOrderedLogStore(t)
+	log, err := store.logFor("sessions")
+	if err != nil {
+		t.Fatalf("logFor: %v", err)
+	}
+	mustAppend(t, log, createMutation("host", "alpha", 1))
+	logPath := filepath.Join(root, orderedDirName, "sessions"+orderedLogExt)
+
+	// A distinct open file description over the same file: flock conflicts
+	// between OFDs, so this stands in for a second process.
+	holder, oerr := os.OpenFile(logPath, os.O_RDWR, 0o600)
+	if oerr != nil {
+		t.Fatalf("open holder: %v", oerr)
+	}
+	defer func() {
+		if cerr := holder.Close(); cerr != nil {
+			t.Errorf("close holder: %v", cerr)
+		}
+	}()
+	if lerr := lockFileEx(holder); lerr != nil {
+		t.Fatalf("hold the advisory lock: %v", lerr)
+	}
+
+	done := make(chan error, 1)
+	go func() { _, aerr := log.append(createMutation("host", "beta", 2)); done <- aerr }()
+	select {
+	case aerr := <-done:
+		t.Fatalf("append completed (%v) while a foreign advisory lock was held", aerr)
+	case <-time.After(250 * time.Millisecond):
+	}
+	if uerr := unlockFile(holder); uerr != nil {
+		t.Fatalf("release the advisory lock: %v", uerr)
+	}
+	select {
+	case aerr := <-done:
+		if aerr != nil {
+			t.Fatalf("append after the lock was released: %v", aerr)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("append did not complete within 10s of the lock being released")
+	}
+	if got := mustReplay(t, log); len(got) != 2 {
+		t.Fatalf("replayed %d mutations, want 2", len(got))
+	}
+}
+
+// TestOrderedLogCrossProcessAppendsSerialize runs real concurrent PROCESSES
+// against one log — the configuration the advisory lock exists for. Every
+// mutation must survive with a contiguous sequence; without the lock the
+// writers compute their append offsets from stale caches and overwrite each
+// other's committed frames.
+func TestOrderedLogCrossProcessAppendsSerialize(t *testing.T) {
+	t.Parallel()
+	const (
+		children = 3
+		perActor = 12
+	)
+	store, root := newTestOrderedLogStore(t)
+	log, err := store.logFor(orderedChildNamespace)
+	if err != nil {
+		t.Fatalf("logFor: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	for i := range children {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			cmd := exec.Command(os.Args[0]) // #nosec G204 -- re-executes this very test binary
+			cmd.Env = append(os.Environ(),
+				orderedChildRootEnv+"="+root,
+				orderedChildKeyEnv+"=child"+strconv.Itoa(i),
+				orderedChildCountEnv+"="+strconv.Itoa(perActor),
+			)
+			if out, cerr := cmd.CombinedOutput(); cerr != nil {
+				t.Errorf("child %d: %v\n%s", i, cerr, out)
+			}
+		}(i)
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := range perActor {
+			key := storage.StableKey("parent-" + strconv.Itoa(i))
+			if _, aerr := log.append(createMutation("host", key, uint64(i+1))); aerr != nil {
+				t.Errorf("parent append %d: %v", i, aerr)
+				return
+			}
+		}
+	}()
+	wg.Wait()
+
+	// replay's own scan enforces a contiguous sequence from 1, so a surviving
+	// count of (children+1)*perActor means no frame was clobbered or lost.
+	want := (children + 1) * perActor
+	got := mustReplay(t, log)
+	if len(got) != want {
+		t.Fatalf("replayed %d mutations, want %d (a lost frame means the flock did not serialize)", len(got), want)
+	}
+	keys := make(map[storage.StableKey]bool, want)
+	for _, m := range got {
+		keys[m.StableKey] = true
+	}
+	if len(keys) != want {
+		t.Errorf("distinct keys replayed = %d, want %d", len(keys), want)
+	}
+}
+
+// TestOrderedWarmLogDropsItsCacheOnCorruption covers the one corruption path no
+// other test reaches: a WARM log (loaded, with a cached tip/size) that hits
+// corruption on a re-scan. Every other corruption test uses a cold store, where
+// loaded is already false.
+//
+// The cache MUST be invalidated by the failed scan. If it were not, the log
+// would keep a stale tip/size, and a later append whose on-disk size happened to
+// match that stale size would take refresh's size-equality fast path and write a
+// frame at the cached offset — extending, and eventually overwriting, a log it
+// cannot read. The sequence below reproduces exactly that: corrupt a committed
+// frame while ALSO changing the length (so the scan runs and fails), then restore
+// the original length (so the fast path would fire).
+func TestOrderedWarmLogDropsItsCacheOnCorruption(t *testing.T) {
+	t.Parallel()
+	store, root := newTestOrderedLogStore(t)
+	const namespace = "sessions"
+	log, err := store.logFor(namespace)
+	if err != nil {
+		t.Fatalf("logFor: %v", err)
+	}
+	for i, key := range []storage.StableKey{"alpha", "beta"} {
+		mustAppend(t, log, createMutation("host", key, uint64(i+1)))
+	}
+	logPath := filepath.Join(root, orderedDirName, namespace+orderedLogExt)
+	committed := readFile(t, logPath)
+
+	// Damage a committed frame in place AND change the length, so the warm
+	// log's size check forces a re-scan that then fails.
+	damaged := append([]byte{}, committed...)
+	damaged[frameHeaderSize+orderedMutationHeaderSize] ^= 0xFF
+	writeFile(t, logPath, append(append([]byte{}, damaged...), make([]byte, 8)...))
+
+	var ce *OrderedLogCorruptError
+	if seq, aerr := log.append(createMutation("host", "gamma", 3)); aerr == nil {
+		t.Fatalf("warm append over a corrupt log succeeded at seq %d, want an error", seq)
+	} else if !errors.As(aerr, &ce) {
+		t.Fatalf("warm append error = %T %v, want *OrderedLogCorruptError", aerr, aerr)
+	}
+
+	// Restore the ORIGINAL length, leaving the damage in place. A stale cache
+	// would now match on size and skip the scan entirely.
+	writeFile(t, logPath, damaged)
+	before := readFile(t, logPath)
+	if seq, aerr := log.append(createMutation("host", "delta", 4)); aerr == nil {
+		t.Errorf("append on a stale warm cache succeeded at seq %d, want an error", seq)
+	} else if !errors.As(aerr, &ce) {
+		t.Errorf("second warm append error = %T %v, want *OrderedLogCorruptError", aerr, aerr)
+	}
+	if after := readFile(t, logPath); !bytes.Equal(after, before) {
+		t.Errorf("a rejected append modified the log: %d bytes -> %d bytes", len(before), len(after))
+	}
 }
