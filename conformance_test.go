@@ -141,18 +141,19 @@ func assertFSOrderedIndexCounters(t *testing.T, ctx context.Context, index stora
 	}
 }
 
-// TestOrderedIndexProductionDoesNotEnumerateDirectories makes the filesystem-
-// walk half of the bounded-page contract structural. Byte/frame counters detect
-// prefix replay but cannot observe directory-entry reads, so the ordered
-// provider's production files also forbid every standard directory enumeration
-// entry point. The parsed-file count keeps the assertion from passing vacuously.
-func TestOrderedIndexProductionDoesNotEnumerateDirectories(t *testing.T) {
+// TestOrderedIndexProductionHasNoUnapprovedDirectoryEnumeration makes the
+// filesystem-walk half of the bounded-page contract structural. Byte/frame
+// counters detect prefix replay but cannot observe directory-entry reads, so
+// package-qualified standard enumeration calls require an explicit allowlist.
+func TestOrderedIndexProductionHasNoUnapprovedDirectoryEnumeration(t *testing.T) {
 	t.Parallel()
 	paths, err := filepath.Glob("*.go")
 	if err != nil {
 		t.Fatalf("glob ordered production files: %v", err)
 	}
 	parsed := 0
+	allowedWalkImplementations := 0
+	allowedWalkCalls := 0
 	for _, path := range paths {
 		if strings.HasSuffix(path, "_test.go") {
 			continue
@@ -173,37 +174,67 @@ func TestOrderedIndexProductionDoesNotEnumerateDirectories(t *testing.T) {
 			if spec.Name != nil {
 				name = spec.Name.Name
 			}
+			if name == "." && (importPath == "path/filepath" || importPath == "io/fs" || importPath == "os") {
+				t.Errorf("%s dot-imports directory API package %q; enumeration calls would be unqualified", path, importPath)
+			}
 			imports[name] = importPath
 		}
-		ast.Inspect(file, func(node ast.Node) bool {
-			selector, ok := node.(*ast.SelectorExpr)
-			if !ok {
-				return true
+		for _, declaration := range file.Decls {
+			function, ok := declaration.(*ast.FuncDecl)
+			if !ok || function.Body == nil {
+				continue
 			}
-			ident, _ := selector.X.(*ast.Ident)
-			qualifier := ""
-			if ident != nil {
-				qualifier = imports[ident.Name]
-			}
-			forbidden := (qualifier == "path/filepath" && (selector.Sel.Name == "Walk" || selector.Sel.Name == "WalkDir" || selector.Sel.Name == "Glob")) ||
-				(qualifier == "io/fs" && (selector.Sel.Name == "WalkDir" || selector.Sel.Name == "ReadDir" || selector.Sel.Name == "Glob")) ||
-				(qualifier == "os" && selector.Sel.Name == "ReadDir") ||
-				selector.Sel.Name == "Readdir" || selector.Sel.Name == "Readdirnames" || selector.Sel.Name == "ReadDir"
-			// fswrite's durability helper walks a just-created directory chain; it
-			// is not reachable from OrderedIndex. Any additional enumeration site
-			// requires an explicit review here rather than silently entering a page.
-			if path == "fswrite.go" && qualifier == "path/filepath" && selector.Sel.Name == "WalkDir" {
-				forbidden = false
-			}
-			if forbidden {
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				call, ok := node.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "walkKeys" {
+					if (path == "kv.go" && function.Name.Name == "Keys") ||
+						(path == "blobs.go" && function.Name.Name == "List") {
+						allowedWalkCalls++
+						return true
+					}
+					position := fileSet.Position(ident.Pos())
+					t.Errorf("unapproved walkKeys call: %s:%d %s", path, position.Line, function.Name.Name)
+					return true
+				}
+				selector, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok {
+					return true
+				}
+				ident, ok := selector.X.(*ast.Ident)
+				if !ok {
+					return true // a local method call, not a package-qualified API
+				}
+				qualifier := imports[ident.Name]
+				forbidden := (qualifier == "path/filepath" && (selector.Sel.Name == "Walk" || selector.Sel.Name == "WalkDir" || selector.Sel.Name == "Glob")) ||
+					(qualifier == "io/fs" && (selector.Sel.Name == "WalkDir" || selector.Sel.Name == "ReadDir" || selector.Sel.Name == "Glob")) ||
+					(qualifier == "os" && selector.Sel.Name == "ReadDir")
+				if !forbidden {
+					return true
+				}
+				// walkKeys is the one intentional full-tree implementation, shared
+				// only by KV.Keys and Blobs.List. OrderedIndex's Get/List methods
+				// and withView path do not call it.
+				if path == "fswrite.go" && function.Name.Name == "walkKeys" && qualifier == "path/filepath" && selector.Sel.Name == "WalkDir" {
+					allowedWalkImplementations++
+					return true
+				}
 				position := fileSet.Position(selector.Pos())
-				t.Errorf("ordered provider directory enumeration is forbidden: %s:%d calls %s", path, position.Line, selector.Sel.Name)
-			}
-			return true
-		})
+				t.Errorf("unapproved directory enumeration: %s:%d %s calls %s.%s", path, position.Line, function.Name.Name, ident.Name, selector.Sel.Name)
+				return true
+			})
+		}
 	}
 	if parsed == 0 {
 		t.Fatal("no production files parsed")
+	}
+	if allowedWalkImplementations != 1 {
+		t.Fatalf("approved fswrite.go/walkKeys filepath.WalkDir calls = %d, want 1", allowedWalkImplementations)
+	}
+	if allowedWalkCalls != 2 {
+		t.Fatalf("approved KV.Keys/Blobs.List walkKeys calls = %d, want 2", allowedWalkCalls)
 	}
 }
 

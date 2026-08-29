@@ -1081,6 +1081,13 @@ func (l *orderedLog) withView(ctx context.Context, mutating bool, fn func(v *ord
 	}
 	defer l.mu.unlock()
 
+	// Acquiring the permit can race cancellation. Recheck immediately before
+	// MkdirAll/OpenFile(O_CREATE), so a caller that cancels while queued cannot
+	// leave a fresh namespace directory or empty log behind.
+	if cerr := ctx.Err(); cerr != nil {
+		return 0, cerr
+	}
+
 	dir := filepath.Dir(l.path)
 	flags := os.O_RDWR
 	if mutating {

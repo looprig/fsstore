@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1567,6 +1568,54 @@ func TestOrderedLogHonorsCancellationBeforeWork(t *testing.T) {
 	}
 	if after := readFile(t, logPath); !bytes.Equal(after, before) {
 		t.Errorf("a cancelled call modified the log: %d bytes -> %d bytes", len(before), len(after))
+	}
+}
+
+// cancelOnErrObservationContext becomes cancelled on its Nth Err call. Done is
+// closed at the same transition, so it remains a valid context while giving a
+// test deterministic control over cancellation between internal stages.
+type cancelOnErrObservationContext struct {
+	context.Context
+	cancelAt int32
+	calls    atomic.Int32
+	done     chan struct{}
+	once     sync.Once
+}
+
+func (c *cancelOnErrObservationContext) Done() <-chan struct{} { return c.done }
+
+func (c *cancelOnErrObservationContext) Err() error {
+	if c.calls.Add(1) < c.cancelAt {
+		return nil
+	}
+	c.once.Do(func() { close(c.done) })
+	return context.Canceled
+}
+
+// TestOrderedLogCancellationBeforeFreshNamespaceSetup pins the boundary after
+// the namespace permit is acquired but before MkdirAll/OpenFile(O_CREATE). A
+// cancelled create must return without leaving either the namespace directory
+// or an empty log behind.
+func TestOrderedLogCancellationBeforeFreshNamespaceSetup(t *testing.T) {
+	t.Parallel()
+	store, _ := newTestOrderedLogStore(t)
+	log, err := store.logFor("fresh/cancelled")
+	if err != nil {
+		t.Fatalf("logFor: %v", err)
+	}
+	ctx := &cancelOnErrObservationContext{
+		Context:  context.Background(),
+		cancelAt: 3, // before-lock, after-permit, then before filesystem setup
+		done:     make(chan struct{}),
+	}
+	seq, err := commitMutation(ctx, log, createMutation("host", "alpha", 1))
+	if !errors.Is(err, context.Canceled) || seq != 0 {
+		t.Fatalf("fresh create cancelled before setup = (%d, %T %v), want (0, context.Canceled)", seq, err, err)
+	}
+	for _, path := range []string{log.path, filepath.Dir(log.path)} {
+		if _, statErr := os.Stat(path); !errors.Is(statErr, fs.ErrNotExist) {
+			t.Errorf("cancelled fresh create left %q on disk: stat error %v", path, statErr)
+		}
 	}
 }
 
