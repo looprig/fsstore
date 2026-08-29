@@ -2,6 +2,7 @@ package fsstore
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io/fs"
 	"os"
@@ -50,7 +51,7 @@ func createMutation(scope string, key storage.StableKey, order uint64) orderedMu
 // mustAppend appends m and returns the assigned log sequence.
 func mustAppend(t *testing.T, log *orderedLog, m orderedMutation) uint64 {
 	t.Helper()
-	seq, err := log.append(m)
+	seq, err := log.append(context.Background(), m)
 	if err != nil {
 		t.Fatalf("append %+v: %v", m, err)
 	}
@@ -60,7 +61,7 @@ func mustAppend(t *testing.T, log *orderedLog, m orderedMutation) uint64 {
 // mustReplay replays log and returns its mutations.
 func mustReplay(t *testing.T, log *orderedLog) []orderedMutation {
 	t.Helper()
-	got, err := log.replay()
+	got, err := log.replay(context.Background())
 	if err != nil {
 		t.Fatalf("replay: %v", err)
 	}
@@ -296,7 +297,7 @@ func TestOrderedLogRejectsUnwritableStableKey(t *testing.T) {
 			if err != nil {
 				t.Fatalf("logFor: %v", err)
 			}
-			if seq, aerr := log.append(createMutation("host", tt.key, 1)); aerr == nil {
+			if seq, aerr := log.append(context.Background(), createMutation("host", tt.key, 1)); aerr == nil {
 				t.Fatalf("append of an unrepresentable key succeeded at seq %d", seq)
 			} else {
 				var ce *OrderedCodecError
@@ -304,7 +305,10 @@ func TestOrderedLogRejectsUnwritableStableKey(t *testing.T) {
 					t.Fatalf("want *OrderedCodecError, got %T: %v", aerr, aerr)
 				}
 			}
-			// The rejection must leave nothing durable behind.
+			// The rejection must write no FRAME. It may still leave an empty
+			// log file: O_CREATE fires before the log reads its own state, so
+			// the absence of a file here is a consequence of codec validation
+			// running first, not a guarantee the append path makes.
 			logPath := filepath.Join(root, orderedDirName, "sessions"+orderedLogExt)
 			if info, serr := os.Stat(logPath); serr == nil && info.Size() != 0 {
 				t.Errorf("log file grew to %d bytes on a rejected append", info.Size())
@@ -564,7 +568,7 @@ func TestOrderedCorruptionFailsClosed(t *testing.T) {
 				t.Fatalf("cold logFor: %v", lerr)
 			}
 
-			got, rerr := coldLog.replay()
+			got, rerr := coldLog.replay(context.Background())
 			if rerr == nil {
 				t.Fatalf("replay of a corrupt log returned %d mutations, want an error", len(got))
 			}
@@ -587,7 +591,7 @@ func TestOrderedCorruptionFailsClosed(t *testing.T) {
 			// new records. Payload-level damage is outside what the frame-layer
 			// re-scan can see, and there the requirement is only that the append
 			// does not conceal it: replay must still fail closed afterwards.
-			seq, aerr := coldLog.append(createMutation("host", "gamma", 3))
+			seq, aerr := coldLog.append(context.Background(), createMutation("host", "gamma", 3))
 			switch {
 			case tt.appendFailsClosed:
 				if aerr == nil {
@@ -599,7 +603,7 @@ func TestOrderedCorruptionFailsClosed(t *testing.T) {
 				if aerr != nil {
 					t.Errorf("frame-layer-valid log: append = %v, want success", aerr)
 				}
-				if _, rerr2 := coldLog.replay(); !errors.As(rerr2, &ce) {
+				if _, rerr2 := coldLog.replay(context.Background()); !errors.As(rerr2, &ce) {
 					t.Errorf("replay after append = %T %v, want the damage still reported", rerr2, rerr2)
 				}
 			}
@@ -724,7 +728,7 @@ func TestOrderedLogConcurrentAppendsSerialize(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			seq, aerr := log.append(createMutation("host", storage.StableKey("k"+strconv.Itoa(i)), uint64(i+1)))
+			seq, aerr := log.append(context.Background(), createMutation("host", storage.StableKey("k"+strconv.Itoa(i)), uint64(i+1)))
 			if aerr != nil {
 				t.Errorf("concurrent append %d: %v", i, aerr)
 				return
@@ -879,7 +883,7 @@ func runOrderedAppendChild(root, keyPrefix, count string) int {
 	}
 	for i := range n {
 		key := storage.StableKey(keyPrefix + "-" + strconv.Itoa(i))
-		if _, aerr := log.append(createMutation("host", key, uint64(i+1))); aerr != nil {
+		if _, aerr := log.append(context.Background(), createMutation("host", key, uint64(i+1))); aerr != nil {
 			os.Stderr.WriteString("child: append: " + aerr.Error() + "\n")
 			return 2
 		}
@@ -917,7 +921,7 @@ func TestOrderedAppendBlocksOnAForeignLock(t *testing.T) {
 	}
 
 	done := make(chan error, 1)
-	go func() { _, aerr := log.append(createMutation("host", "beta", 2)); done <- aerr }()
+	go func() { _, aerr := log.append(context.Background(), createMutation("host", "beta", 2)); done <- aerr }()
 	select {
 	case aerr := <-done:
 		t.Fatalf("append completed (%v) while a foreign advisory lock was held", aerr)
@@ -977,7 +981,7 @@ func TestOrderedLogCrossProcessAppendsSerialize(t *testing.T) {
 		defer wg.Done()
 		for i := range perActor {
 			key := storage.StableKey("parent-" + strconv.Itoa(i))
-			if _, aerr := log.append(createMutation("host", key, uint64(i+1))); aerr != nil {
+			if _, aerr := log.append(context.Background(), createMutation("host", key, uint64(i+1))); aerr != nil {
 				t.Errorf("parent append %d: %v", i, aerr)
 				return
 			}
@@ -1034,7 +1038,7 @@ func TestOrderedWarmLogDropsItsCacheOnCorruption(t *testing.T) {
 	writeFile(t, logPath, append(append([]byte{}, damaged...), make([]byte, 8)...))
 
 	var ce *OrderedLogCorruptError
-	if seq, aerr := log.append(createMutation("host", "gamma", 3)); aerr == nil {
+	if seq, aerr := log.append(context.Background(), createMutation("host", "gamma", 3)); aerr == nil {
 		t.Fatalf("warm append over a corrupt log succeeded at seq %d, want an error", seq)
 	} else if !errors.As(aerr, &ce) {
 		t.Fatalf("warm append error = %T %v, want *OrderedLogCorruptError", aerr, aerr)
@@ -1044,7 +1048,7 @@ func TestOrderedWarmLogDropsItsCacheOnCorruption(t *testing.T) {
 	// would now match on size and skip the scan entirely.
 	writeFile(t, logPath, damaged)
 	before := readFile(t, logPath)
-	if seq, aerr := log.append(createMutation("host", "delta", 4)); aerr == nil {
+	if seq, aerr := log.append(context.Background(), createMutation("host", "delta", 4)); aerr == nil {
 		t.Errorf("append on a stale warm cache succeeded at seq %d, want an error", seq)
 	} else if !errors.As(aerr, &ce) {
 		t.Errorf("second warm append error = %T %v, want *OrderedLogCorruptError", aerr, aerr)
@@ -1132,7 +1136,7 @@ func TestOrderedLogCorruptErrorPrecedence(t *testing.T) {
 
 	// Caller garbage: the bare codec error, with no corruption wrapper.
 	badInput := createMutation("host", "", 1)
-	if _, aerr := log.append(badInput); aerr == nil {
+	if _, aerr := log.append(context.Background(), badInput); aerr == nil {
 		t.Fatal("append of an invalid mutation succeeded")
 	} else if !errors.As(aerr, &ce) {
 		t.Fatalf("caller-input error = %T %v, want *OrderedCodecError", aerr, aerr)
@@ -1168,7 +1172,7 @@ func TestOrderedLogCorruptErrorPrecedence(t *testing.T) {
 	if lerr != nil {
 		t.Fatalf("cold logFor: %v", lerr)
 	}
-	_, rerr := coldLog.replay()
+	_, rerr := coldLog.replay(context.Background())
 	if !errors.As(rerr, &lce) {
 		t.Fatalf("disk-damage error = %T %v, want *OrderedLogCorruptError", rerr, rerr)
 	}
@@ -1250,5 +1254,89 @@ func TestOrderedNameCeilingMatchesStorage(t *testing.T) {
 	}
 	if err := storage.ValidateName(strings.Repeat("a", maxOrderedNameBytes+1)); err == nil {
 		t.Errorf("storage.ValidateName accepts a name of maxOrderedNameBytes+1 (%d), so the ceiling has drifted", maxOrderedNameBytes+1)
+	}
+}
+
+// TestOrderedLogStoreFailsClosedAfterClose pins that Close is a one-way door.
+// Close drops the namespace->orderedLog registry; if logFor then minted a fresh
+// log, a namespace with an append in flight would end up with TWO mutexes
+// guarding one file — an invariant surviving only by accident of the advisory
+// lock. The store must refuse instead.
+func TestOrderedLogStoreFailsClosedAfterClose(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	store, err := newOrderedLogStore(root)
+	if err != nil {
+		t.Fatalf("newOrderedLogStore: %v", err)
+	}
+	log, lerr := store.logFor("sessions")
+	if lerr != nil {
+		t.Fatalf("logFor: %v", lerr)
+	}
+	mustAppend(t, log, createMutation("host", "alpha", 1))
+	if cerr := store.Close(); cerr != nil {
+		t.Fatalf("close: %v", cerr)
+	}
+	if cerr := store.Close(); cerr != nil {
+		t.Errorf("second close: %v, want idempotent success", cerr)
+	}
+
+	reopened, rerr := store.logFor("sessions")
+	if rerr == nil {
+		t.Fatalf("logFor after Close returned %+v, want an error", reopened)
+	}
+	if reopened != nil {
+		t.Errorf("log = %+v, want nil on error", reopened)
+	}
+	var closedErr *OrderedLogClosedError
+	if !errors.As(rerr, &closedErr) {
+		t.Fatalf("want *OrderedLogClosedError, got %T: %v", rerr, rerr)
+	}
+	if closedErr.Namespace != "sessions" {
+		t.Errorf("error namespace = %q, want %q", closedErr.Namespace, "sessions")
+	}
+	// A fresh store over the same root is the supported way back in.
+	fresh, ferr := newOrderedLogStore(root)
+	if ferr != nil {
+		t.Fatalf("reopen: %v", ferr)
+	}
+	defer func() {
+		if err := fresh.Close(); err != nil {
+			t.Errorf("close fresh store: %v", err)
+		}
+	}()
+	freshLog, flerr := fresh.logFor("sessions")
+	if flerr != nil {
+		t.Fatalf("fresh logFor: %v", flerr)
+	}
+	if got := mustReplay(t, freshLog); len(got) != 1 {
+		t.Errorf("replayed %d mutations, want 1", len(got))
+	}
+}
+
+// TestOrderedLogHonorsCancellationBeforeWork pins the documented contract:
+// cancellation refuses to START work. A cancelled context must be reported
+// before any lock is taken and, for append, before anything is written.
+func TestOrderedLogHonorsCancellationBeforeWork(t *testing.T) {
+	t.Parallel()
+	store, root := newTestOrderedLogStore(t)
+	log, err := store.logFor("sessions")
+	if err != nil {
+		t.Fatalf("logFor: %v", err)
+	}
+	mustAppend(t, log, createMutation("host", "alpha", 1))
+	logPath := filepath.Join(root, orderedDirName, "sessions"+orderedLogExt)
+	before := readFile(t, logPath)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if seq, aerr := log.append(ctx, createMutation("host", "beta", 2)); !errors.Is(aerr, context.Canceled) {
+		t.Errorf("append(cancelled) = (%d, %v), want context.Canceled", seq, aerr)
+	}
+	if _, rerr := log.replay(ctx); !errors.Is(rerr, context.Canceled) {
+		t.Errorf("replay(cancelled) = %v, want context.Canceled", rerr)
+	}
+	if after := readFile(t, logPath); !bytes.Equal(after, before) {
+		t.Errorf("a cancelled call modified the log: %d bytes -> %d bytes", len(before), len(after))
 	}
 }

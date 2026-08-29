@@ -126,19 +126,6 @@ func (op orderedOp) valid() bool {
 	return op == orderedOpCreate || op == orderedOpUpdate || op == orderedOpDelete
 }
 
-func (op orderedOp) String() string {
-	switch op {
-	case orderedOpCreate:
-		return "create"
-	case orderedOpUpdate:
-		return "update"
-	case orderedOpDelete:
-		return "delete"
-	default:
-		return "op(" + strconv.Itoa(int(op)) + ")"
-	}
-}
-
 // orderedMutation is one durable record state transition. It is a full record
 // snapshot minus the namespace, which is implied by the log file the frame lives
 // in — so replaying a namespace's log needs no cross-frame reasoning beyond

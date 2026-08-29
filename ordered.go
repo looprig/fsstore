@@ -1,6 +1,7 @@
 package fsstore
 
 import (
+	"context"
 	"errors"
 	"io"
 	"io/fs"
@@ -37,6 +38,23 @@ import (
 // once, at open, from a SEQUENTIAL read of one file per namespace — not from a
 // directory walk whose cost grows with the record count on every call.
 //
+// # Open item: the log is never compacted
+//
+// What the previous paragraph buys is a bounded READ path. It does not make the
+// startup path bounded, and this file does not yet solve that. replay returns
+// EVERY mutation ever written for a namespace — each carrying up to 1 MiB of
+// Value — all live at once, so open cost is proportional to total HISTORY rather
+// than to live records: 10k records updated 100 times each is 1M mutations
+// decoded and held before the first read is served. That is a real trade of
+// unbounded paging for unbounded startup memory and time, not a solved problem.
+//
+// Closing it needs one of two things, neither built here: a checkpoint/snapshot
+// file that replay starts from and the log tail replays onto, or a
+// rewrite-and-rename compaction (fold the log to one frame per live identity
+// into a temp file, fsync, rename, fsync the directory) performed under the same
+// advisory lock that guards append. Until then a namespace's log grows without
+// bound and a caller should treat replay's cost as O(total mutations).
+//
 // # Locking model
 //
 // This mirrors the ledger's proven two-layer model, and the append critical
@@ -57,13 +75,21 @@ import (
 //
 // # Fault model
 //
-// A torn tail (an interrupted final append) is recovered by truncating back to
-// the last whole frame: the partial mutation was never acknowledged, so dropping
-// it loses nothing. Anything else — a checksum mismatch, a frame that decodes to
-// an illegal mutation, or a sequence gap — is corruption that truncation cannot
-// repair, and every operation fails closed with an *OrderedLogCorruptError rather
-// than silently dropping or misreading a committed mutation. In particular an
-// append refuses to extend a log it cannot read, which would bury the damage.
+// A torn tail is recovered by truncating back to the last whole frame: the
+// partial mutation was never acknowledged, so dropping it loses nothing. THREE
+// artifacts count as torn, not just the obvious one — an incomplete final frame,
+// a frame stamped with the never-emitted sequence 0, and an all-zero trailing
+// region (the common post-crash artifact of a filesystem that journalled the new
+// size before the data blocks). scanOrderedLog explains why the last two are not
+// self-evident and why misclassifying them would brick a namespace.
+//
+// Anything else — a checksum mismatch, a frame that decodes to an illegal
+// mutation, or a sequence gap — is corruption that truncation cannot repair, and
+// every operation fails closed with an *OrderedLogCorruptError rather than
+// silently dropping or misreading a committed mutation. In particular an append
+// refuses to extend a log whose FRAMING it cannot read; payload-level damage is
+// caught by replay rather than by append, a bounded weakening that scanOrderedLog
+// states and TestOrderedCorruptionFailsClosed pins.
 //
 // # StableKey never reaches a path
 //
@@ -134,6 +160,22 @@ func (e *OrderedLogPathError) Error() string {
 		" maps outside the ordered log root: " + strconv.Quote(e.Path)
 }
 
+// OrderedLogClosedError reports an operation on a closed ordered log store.
+// Close drops the namespace->orderedLog registry, so a later logFor would mint a
+// FRESH orderedLog with a NEW mutex for a namespace another goroutine may still
+// be appending to under the old one — two mutexes guarding one file, surviving
+// only because the advisory lock happens to serialize the descriptors. Failing
+// closed is the same discipline Store.Close already applies.
+type OrderedLogClosedError struct {
+	Root      string
+	Namespace string
+}
+
+func (e *OrderedLogClosedError) Error() string {
+	return "fsstore: ordered log store " + strconv.Quote(e.Root) +
+		" is closed: cannot open namespace " + strconv.Quote(e.Namespace)
+}
+
 // OrderedLogRootError reports that newOrderedLogStore was given an unusable root
 // (for example, an empty or blank path).
 type OrderedLogRootError struct {
@@ -174,8 +216,9 @@ type orderedLogStore struct {
 	root string // cleaned store root
 	dir  string // cleaned <root>/ordered
 
-	mu   sync.Mutex
-	logs map[string]*orderedLog
+	mu     sync.Mutex
+	closed bool
+	logs   map[string]*orderedLog
 }
 
 // newOrderedLogStore creates <root> and <root>/ordered at 0700 and returns a log
@@ -193,6 +236,13 @@ func newOrderedLogStore(root string) (*orderedLogStore, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, &OrderedLogIOError{Op: "mkdir", Path: dir, Cause: err}
 	}
+	// fsync the ROOT so the "ordered" dirent itself is durable. append's
+	// fsyncDirChain stops AT <root>/ordered and can therefore never make the
+	// entry for that directory durable, so without this a crash could take the
+	// directory and every log beneath it.
+	if err := fsyncDir(clean, orderedIOErr); err != nil {
+		return nil, err
+	}
 	return &orderedLogStore{root: clean, dir: dir, logs: make(map[string]*orderedLog)}, nil
 }
 
@@ -200,12 +250,17 @@ func newOrderedLogStore(root string) (*orderedLogStore, error) {
 // namespace->orderedLog registry (the sequence/size metadata observed after the
 // last operation). The store holds no long-lived file descriptors — every append
 // and replay opens and closes its fd within the call — so there are no handles to
-// release. Close is idempotent: it resets the registry to an empty map, so a
-// second call, or a stray operation afterwards, is safe rather than a nil-map
-// panic.
+// release. Close is idempotent: a second call is a no-op returning nil.
+//
+// After Close, logFor fails with an *OrderedLogClosedError rather than minting a
+// fresh orderedLog. Handing out a NEW log — and so a new mutex — for a namespace
+// an in-flight append still holds the old mutex for would leave two mutexes
+// guarding one file, an invariant that survives only by accident of the advisory
+// lock. Open a fresh store on the same root to use it again.
 func (s *orderedLogStore) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.closed = true
 	s.logs = make(map[string]*orderedLog)
 	return nil
 }
@@ -243,6 +298,9 @@ func (s *orderedLogStore) logFor(namespace string) (*orderedLog, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return nil, &OrderedLogClosedError{Root: s.root, Namespace: namespace}
+	}
 	log := s.logs[namespace]
 	if log == nil {
 		log = &orderedLog{namespace: namespace, path: path, stopDir: s.dir}
@@ -276,7 +334,16 @@ type orderedLog struct {
 // other fault returns an *OrderedLogCorruptError and no mutations.
 //
 // It takes the advisory lock because recovery truncates, which is a write.
-func (l *orderedLog) replay() (mutations []orderedMutation, err error) {
+//
+// ctx is checked ONCE, before any lock is taken, and not again: the in-process
+// mutex and the blocking LOCK_EX that follow are not cancellable, and the file
+// work between them is a single bounded read. Cancellation therefore refuses to
+// START work; it never abandons work in progress, which for a path that may
+// truncate a torn tail is the only safe reading.
+func (l *orderedLog) replay(ctx context.Context) (mutations []orderedMutation, err error) {
+	if cerr := ctx.Err(); cerr != nil {
+		return nil, cerr
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -319,9 +386,22 @@ func (l *orderedLog) replay() (mutations []orderedMutation, err error) {
 // sequence.
 //
 // The mutation is validated BEFORE any file is opened, so a rejected mutation
-// creates no log file and leaves no trace. A corrupt log fails the append closed:
-// a writer must never extend a log it cannot read.
-func (l *orderedLog) append(m orderedMutation) (seq uint64, err error) {
+// writes nothing. (It may still leave an EMPTY log file behind: O_CREATE fires
+// before the on-disk state is read, so a first append rejected by the log rather
+// than by the codec creates the file without a frame. An empty log is
+// indistinguishable from an absent one to every reader here.) A log whose FRAMING
+// cannot be read fails the append closed: a writer must never extend a log it
+// cannot read.
+//
+// ctx is checked once, before any lock is taken, and not again — see replay for
+// why. A non-nil error with a NONZERO seq means the frame WAS committed and
+// fsynced and only the close or unlock that followed failed; the caller must not
+// treat that as "nothing happened" and retry, which for CreateOrdered would burn
+// a second order for one identity.
+func (l *orderedLog) append(ctx context.Context, m orderedMutation) (seq uint64, err error) {
+	if cerr := ctx.Err(); cerr != nil {
+		return 0, cerr
+	}
 	if verr := validateOrderedMutation(m); verr != nil {
 		return 0, verr
 	}
@@ -341,9 +421,13 @@ func (l *orderedLog) append(m orderedMutation) (seq uint64, err error) {
 	if oerr != nil {
 		return 0, &OrderedLogIOError{Op: "open", Path: l.path, Cause: oerr}
 	}
+	// These two defers deliberately leave seq alone. They only fire when the
+	// append already returned successfully, so seq is the sequence of a frame
+	// that is on the disk and fsynced; zeroing it would report a committed
+	// mutation as "nothing happened" and invite a duplicate retry.
 	defer func() {
 		if cerr := f.Close(); cerr != nil && err == nil {
-			seq, err = 0, &OrderedLogIOError{Op: "close", Path: l.path, Cause: cerr}
+			err = &OrderedLogIOError{Op: "close", Path: l.path, Cause: cerr}
 		}
 	}()
 	if lerr := lockFileEx(f); lerr != nil {
@@ -351,7 +435,7 @@ func (l *orderedLog) append(m orderedMutation) (seq uint64, err error) {
 	}
 	defer func() {
 		if uerr := unlockFile(f); uerr != nil && err == nil {
-			seq, err = 0, uerr
+			err = uerr
 		}
 	}()
 
