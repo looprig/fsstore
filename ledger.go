@@ -461,9 +461,47 @@ func (s *ledgerStore) Delete(ctx context.Context, name string) (err error) {
 
 // scanFrames walks the concatenated frames in data, verifying that sequences are
 // contiguous from 1. It returns the last good sequence and goodEnd, the byte
-// offset just past the last whole frame. A torn tail (an incomplete final frame)
-// stops the walk cleanly at goodEnd (recoverable by truncation); a corrupt frame
-// or a sequence gap returns a *LedgerCorruptError (fail closed).
+// offset just past the last whole frame.
+//
+// A torn tail stops the walk cleanly at goodEnd and is recoverable by
+// truncation. Three artifacts are torn — the same three scanOrderedLog
+// classifies, and for the same reasons; the two scans are siblings and must stay
+// recognizably so:
+//
+//   - an incomplete final frame (the frame layer reports it short);
+//   - a frame stamped with sequence 0, which this writer can never emit because
+//     Append always stamps lf.tip+1 >= 1;
+//   - a trailing region that is entirely zero. This is the most common
+//     post-crash artifact of all — a filesystem that journalled the new file
+//     size before the data blocks leaves the extended region reading as zeros —
+//     and it is NOT self-evidently torn: 16 zero bytes decode as a structurally
+//     VALID frame, because len is 0, seq is 0, the stored crc is 0, and crc32c
+//     of an empty payload is exactly 0.
+//
+// Under THIS header layout the seq-0 rule alone decides every zero tail, at any
+// alignment: a zero remainder of 16 bytes or more decodes cleanly as a seq-0
+// frame, and a shorter one is already a short header. That makes the allZero arm
+// below unreachable today — it can only be evaluated after a non-torn decode
+// fault, which an all-zero buffer cannot produce. It is kept deliberately, as
+// the explicit statement of the rule the seq-0 check enforces only by numerical
+// coincidence, and so this scan stays byte-for-byte a sibling of scanOrderedLog.
+// It runs only on the decode-fault path, so the walk stays linear regardless.
+//
+// BEHAVIOURAL CHANGE (fsstore v0.5.0): before this, a zero-filled tail walked
+// past the frame layer and then tripped the contiguity check below, so the
+// ledger was declared "corrupt at seq 0" and Tip, Read and Append all failed
+// closed forever with no repair path anywhere in the module. Such a ledger now
+// recovers: the zero tail is truncated away and the stream continues from its
+// last good record. Truncating an unwritten region discards nothing that was
+// ever acknowledged to a caller, so the new behaviour is the correct one, but it
+// IS a recovery-semantics change to a released module — a file that used to
+// raise a hard error now silently repairs itself.
+//
+// Every other fault — a checksum mismatch, an over-ceiling declared length, or a
+// non-zero sequence that breaks contiguity — is damage truncation cannot repair
+// and still returns a *LedgerCorruptError (fail closed).
+//
+// allZero is shared with scanOrderedLog and lives beside it in ordered.go.
 func scanFrames(data []byte, path string) (lastSeq uint64, goodEnd int64, err error) {
 	off := 0
 	var expect uint64 = 1
@@ -471,10 +509,15 @@ func scanFrames(data []byte, path string) (lastSeq uint64, goodEnd int64, err er
 		seq, _, n, derr := decodeFrame(data[off:])
 		if derr != nil {
 			var fe *FrameError
-			if errors.As(derr, &fe) && fe.IsTorn() {
+			if (errors.As(derr, &fe) && fe.IsTorn()) || allZero(data[off:]) {
 				return lastSeq, int64(off), nil // torn tail: good up to off
 			}
 			return 0, 0, &LedgerCorruptError{Path: path, Seq: expect, Cause: derr}
+		}
+		if seq == 0 {
+			// Never emitted by this writer: an unwritten (zero-filled) tail, not
+			// a committed frame. Belt and braces alongside the all-zero check.
+			return lastSeq, int64(off), nil
 		}
 		if seq != expect {
 			return 0, 0, &LedgerCorruptError{Path: path, Seq: seq, Cause: errNonContiguousSeq}

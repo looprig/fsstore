@@ -3,8 +3,10 @@ package fsstore
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
@@ -257,6 +259,69 @@ func TestLedgerCorruptFailsClosed(t *testing.T) {
 		return root
 	}
 
+	// writeFrames writes an arbitrary byte image as the ledger file, so a test
+	// can hand-build a tail the encoder would never produce.
+	writeFrames := func(t *testing.T, data []byte) string {
+		t.Helper()
+		root := t.TempDir()
+		if _, err := newLedgerStore(root); err != nil {
+			t.Fatalf("newLedgerStore: %v", err)
+		}
+		path := ledgerFilePath(root, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatalf("write file: %v", err)
+		}
+		return root
+	}
+
+	// frame1 is one well-formed seq-1 frame, the clean prefix every hand-built
+	// tail below is appended to.
+	frame1 := func(t *testing.T) []byte {
+		t.Helper()
+		f, err := encodeFrame(1, []byte("one"))
+		if err != nil {
+			t.Fatalf("encodeFrame 1: %v", err)
+		}
+		return f
+	}
+
+	// oversize declares a payload longer than MaxFramePayload. The bytes are not
+	// present and never can be, but the fault is Corrupt, not Torn: a decoder
+	// must reject it before sizing any buffer to the declared length.
+	oversize := func(t *testing.T) string {
+		t.Helper()
+		hdr := make([]byte, frameHeaderSize)
+		binary.LittleEndian.PutUint32(hdr[0:4], uint32(MaxFramePayload)+1)
+		binary.LittleEndian.PutUint64(hdr[8:16], 2)
+		return writeFrames(t, append(frame1(t), hdr...))
+	}
+
+	// nonZeroTail is the counterpart of the zero-filled tail: a COMPLETE frame
+	// whose every declared byte is present but whose CRC does not match. The
+	// zero-tail recovery must not widen into "any trailing garbage truncates".
+	nonZeroTail := func(t *testing.T) string {
+		t.Helper()
+		tail := make([]byte, frameHeaderSize+4)
+		binary.LittleEndian.PutUint32(tail[0:4], 4)
+		binary.LittleEndian.PutUint32(tail[4:8], 0xDEADBEEF) // deliberately wrong
+		binary.LittleEndian.PutUint64(tail[8:16], 2)
+		copy(tail[frameHeaderSize:], "abcd")
+		return writeFrames(t, append(frame1(t), tail...))
+	}
+
+	// halfZeroTail zeroes only the first 8 bytes of the trailing frame's header,
+	// leaving a nonzero sequence behind. The region is neither a whole zero frame
+	// nor all-zero, so it stays corruption.
+	halfZeroTail := func(t *testing.T) string {
+		t.Helper()
+		tail := make([]byte, frameHeaderSize)
+		binary.LittleEndian.PutUint64(tail[8:16], 7) // len and crc zero, seq 7
+		return writeFrames(t, append(frame1(t), tail...))
+	}
+
 	corruptions := []struct {
 		label         string
 		build         func(t *testing.T) string
@@ -265,6 +330,9 @@ func TestLedgerCorruptFailsClosed(t *testing.T) {
 	}{
 		{label: "crc mismatch", build: crcFlip, wantSeq: 1, nonContiguous: false},
 		{label: "sequence gap", build: seqGap, wantSeq: 3, nonContiguous: true},
+		{label: "oversize length", build: oversize, wantSeq: 2, nonContiguous: false},
+		{label: "non-zero garbage tail", build: nonZeroTail, wantSeq: 2, nonContiguous: false},
+		{label: "half-zero header, wrong seq", build: halfZeroTail, wantSeq: 7, nonContiguous: true},
 	}
 	ops := []struct {
 		label string
@@ -455,6 +523,174 @@ func TestNewLedgerStoreValidation(t *testing.T) {
 			if perm := info.Mode().Perm(); perm != 0o700 {
 				t.Errorf("streams perm = %o, want 0700", perm)
 			}
+		})
+	}
+}
+
+// TestLedgerZeroFilledTailRecovery pins the most common real post-crash artifact
+// of all: a filesystem that journalled a file's new size before the data blocks
+// leaves the extended region reading as ZEROS. That region is not self-evidently
+// torn — 16 zero bytes decode as a structurally VALID frame, because len is 0,
+// seq is 0, the stored crc is 0, and crc32c of an empty payload is exactly 0 —
+// so a scan that only trusts the frame layer walks straight past it and then
+// trips its own sequence check, declaring the whole stream permanently corrupt.
+//
+// Every entry point that scans (Tip, Read, Append) must instead treat the zero
+// region as a torn tail and recover to the last good record, and Delete (which
+// does not scan) must stay unconditionally available. The sub-16-byte case is
+// included as a control: it is already torn at the frame layer and already
+// recovered before this fix.
+func TestLedgerZeroFilledTailRecovery(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	const name = "sessions/zerotail"
+	p0 := []byte("first-rec")
+	p1 := []byte("second-record")
+
+	// seed writes a clean two-record ledger and returns its root and path.
+	seed := func(t *testing.T) (string, string) {
+		t.Helper()
+		root := t.TempDir()
+		s, err := newLedgerStore(root)
+		if err != nil {
+			t.Fatalf("newLedgerStore: %v", err)
+		}
+		for i, p := range [][]byte{p0, p1} {
+			if err := s.Append(ctx, name, uint64(i), p); err != nil {
+				t.Fatalf("seed Append %d: %v", i, err)
+			}
+		}
+		return root, ledgerFilePath(root, name)
+	}
+
+	appendTail := func(t *testing.T, path string, tail []byte) {
+		t.Helper()
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600) //nolint:gosec // test-controlled path
+		if err != nil {
+			t.Fatalf("open for append: %v", err)
+		}
+		if _, err := f.Write(tail); err != nil {
+			t.Fatalf("write tail: %v", err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+	}
+
+	cases := []struct {
+		label string
+		tail  func(t *testing.T) []byte
+	}{
+		// 15 zeros is one byte short of a header: already torn before this fix.
+		{"15 zero bytes (short header)", func(*testing.T) []byte { return make([]byte, 15) }},
+		// 16 zeros is the whole bug: a structurally valid, entirely fictional frame.
+		{"16 zero bytes (one whole zero frame)", func(*testing.T) []byte { return make([]byte, 16) }},
+		{"17 zero bytes (unaligned)", func(*testing.T) []byte { return make([]byte, 17) }},
+		{"64 zero bytes", func(*testing.T) []byte { return make([]byte, 64) }},
+		{"4096 zero bytes (one block)", func(*testing.T) []byte { return make([]byte, 4096) }},
+		// An explicit seq-0 frame with a real payload and a correct CRC: not a
+		// zero region at all, but still a sequence this writer can never stamp,
+		// because Append always writes tip+1 >= 1.
+		{"explicit seq 0 frame", func(t *testing.T) []byte {
+			t.Helper()
+			f, err := encodeFrame(0, []byte("ghost"))
+			if err != nil {
+				t.Fatalf("encodeFrame 0: %v", err)
+			}
+			return f
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.label, func(t *testing.T) {
+			t.Parallel()
+
+			t.Run("Tip", func(t *testing.T) {
+				t.Parallel()
+				root, path := seed(t)
+				appendTail(t, path, tc.tail(t))
+				s, err := newLedgerStore(root)
+				if err != nil {
+					t.Fatalf("reopen: %v", err)
+				}
+				tip, err := s.Tip(ctx, name)
+				if err != nil {
+					t.Fatalf("Tip over zero tail: %v", err)
+				}
+				if tip != 2 {
+					t.Errorf("Tip = %d, want 2", tip)
+				}
+			})
+
+			t.Run("Read", func(t *testing.T) {
+				t.Parallel()
+				root, path := seed(t)
+				appendTail(t, path, tc.tail(t))
+				s, err := newLedgerStore(root)
+				if err != nil {
+					t.Fatalf("reopen: %v", err)
+				}
+				recs := readAllRecords(t, s, name, 1)
+				want := [][]byte{p0, p1}
+				if len(recs) != len(want) {
+					t.Fatalf("read %d records, want %d", len(recs), len(want))
+				}
+				for i, rec := range recs {
+					if rec.Seq != uint64(i+1) || !bytes.Equal(rec.Payload, want[i]) {
+						t.Errorf("record[%d] = (%d, %q), want (%d, %q)", i, rec.Seq, rec.Payload, i+1, want[i])
+					}
+				}
+			})
+
+			t.Run("Append", func(t *testing.T) {
+				t.Parallel()
+				root, path := seed(t)
+				appendTail(t, path, tc.tail(t))
+				s, err := newLedgerStore(root)
+				if err != nil {
+					t.Fatalf("reopen: %v", err)
+				}
+				// Recovery rolls the file back to the last good frame, so the
+				// next record lands at seq 3 and the zero tail is gone.
+				if err := s.Append(ctx, name, 2, []byte("third")); err != nil {
+					t.Fatalf("Append(expected=2) over zero tail: %v", err)
+				}
+				recs := readAllRecords(t, s, name, 1)
+				want := [][]byte{p0, p1, []byte("third")}
+				if len(recs) != len(want) {
+					t.Fatalf("read %d records after append, want %d", len(recs), len(want))
+				}
+				for i, rec := range recs {
+					if rec.Seq != uint64(i+1) || !bytes.Equal(rec.Payload, want[i]) {
+						t.Errorf("record[%d] = (%d, %q), want (%d, %q)", i, rec.Seq, rec.Payload, i+1, want[i])
+					}
+				}
+				// The truncation is durable: the file is exactly three frames wide.
+				st, serr := os.Stat(path)
+				if serr != nil {
+					t.Fatalf("stat: %v", serr)
+				}
+				wantSize := frameLen(len(p0)) + frameLen(len(p1)) + frameLen(len("third"))
+				if st.Size() != wantSize {
+					t.Errorf("file size after recovery+append = %d, want %d", st.Size(), wantSize)
+				}
+			})
+
+			t.Run("Delete", func(t *testing.T) {
+				t.Parallel()
+				root, path := seed(t)
+				appendTail(t, path, tc.tail(t))
+				s, err := newLedgerStore(root)
+				if err != nil {
+					t.Fatalf("reopen: %v", err)
+				}
+				if err := s.Delete(ctx, name); err != nil {
+					t.Fatalf("Delete over zero tail: %v", err)
+				}
+				if _, serr := os.Stat(path); !errors.Is(serr, fs.ErrNotExist) {
+					t.Errorf("Stat after Delete = %v, want fs.ErrNotExist", serr)
+				}
+			})
 		})
 	}
 }
