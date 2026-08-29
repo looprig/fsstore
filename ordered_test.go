@@ -1049,3 +1049,126 @@ func TestOrderedWarmLogDropsItsCacheOnCorruption(t *testing.T) {
 		t.Errorf("a rejected append modified the log: %d bytes -> %d bytes", len(before), len(after))
 	}
 }
+
+// TestOrderedErrorMessages covers the log's five exported error types. Each must
+// render a non-empty, fsstore-prefixed message that names its subject, and — the
+// reason this is a test rather than a comment — the two that carry a Cause must
+// not dereference a nil one. A nil Cause is reachable by any caller that
+// constructs the type (a test double, a re-wrap), and a panic inside an error
+// message is the worst possible time to fail.
+func TestOrderedErrorMessages(t *testing.T) {
+	t.Parallel()
+	cause := errors.New("underlying fault")
+	tests := []struct {
+		name     string
+		err      error
+		contains []string
+	}{
+		{
+			name:     "corrupt with a cause",
+			err:      &OrderedLogCorruptError{Path: "/s/ordered/ns.olog", Seq: 7, Cause: cause},
+			contains: []string{"ordered log", "ns.olog", "corrupt at seq 7", "underlying fault"},
+		},
+		{
+			name:     "corrupt with no cause",
+			err:      &OrderedLogCorruptError{Path: "/s/ordered/ns.olog", Seq: 7},
+			contains: []string{"ordered log", "corrupt at seq 7"},
+		},
+		{
+			name:     "io with a cause",
+			err:      &OrderedLogIOError{Op: "fsync", Path: "/s/ordered/ns.olog", Cause: cause},
+			contains: []string{"ordered log fsync", "ns.olog", "underlying fault"},
+		},
+		{
+			name:     "io with no cause",
+			err:      &OrderedLogIOError{Op: "fsync", Path: "/s/ordered/ns.olog"},
+			contains: []string{"ordered log fsync", "ns.olog"},
+		},
+		{
+			name:     "path escape",
+			err:      &OrderedLogPathError{Namespace: "../escape", Path: "/s/escape.olog"},
+			contains: []string{"ordered namespace", "../escape", "maps outside"},
+		},
+		{
+			name:     "unusable root",
+			err:      &OrderedLogRootError{Root: "  ", Reason: "empty root"},
+			contains: []string{"invalid ordered log root", "empty root"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := tt.err.Error()
+			if !strings.HasPrefix(got, "fsstore: ") {
+				t.Errorf("Error() = %q, want an fsstore-prefixed message", got)
+			}
+			for _, want := range tt.contains {
+				if !strings.Contains(got, want) {
+					t.Errorf("Error() = %q, want it to contain %q", got, want)
+				}
+			}
+		})
+	}
+}
+
+// TestOrderedLogCorruptErrorPrecedence pins the documented classification order.
+// replay wraps a codec fault in an *OrderedLogCorruptError, so errors.As finds
+// BOTH types on one disk-corruption error while a rejected caller mutation
+// carries only the codec type. A caller distinguishing "your input was bad" from
+// "the disk is damaged" must therefore test *OrderedLogCorruptError FIRST.
+func TestOrderedLogCorruptErrorPrecedence(t *testing.T) {
+	t.Parallel()
+	store, root := newTestOrderedLogStore(t)
+	log, err := store.logFor("sessions")
+	if err != nil {
+		t.Fatalf("logFor: %v", err)
+	}
+	var ce *OrderedCodecError
+	var lce *OrderedLogCorruptError
+
+	// Caller garbage: the bare codec error, with no corruption wrapper.
+	badInput := createMutation("host", "", 1)
+	if _, aerr := log.append(badInput); aerr == nil {
+		t.Fatal("append of an invalid mutation succeeded")
+	} else if !errors.As(aerr, &ce) {
+		t.Fatalf("caller-input error = %T %v, want *OrderedCodecError", aerr, aerr)
+	} else if errors.As(aerr, &lce) {
+		t.Errorf("caller-input error also matched *OrderedLogCorruptError: %v", aerr)
+	}
+
+	// Disk damage: the SAME codec type, wrapped. Both errors.As calls hit.
+	mustAppend(t, log, createMutation("host", "alpha", 1))
+	logPath := filepath.Join(root, orderedDirName, "sessions"+orderedLogExt)
+	data := readFile(t, logPath)
+	_, payload, _, derr := decodeFrame(data)
+	if derr != nil {
+		t.Fatalf("decode frame 1: %v", derr)
+	}
+	payload[offOrderedVersion] = orderedMutationVersion + 1
+	reframed, eerr := encodeFrame(1, payload)
+	if eerr != nil {
+		t.Fatalf("re-encode frame 1: %v", eerr)
+	}
+	writeFile(t, logPath, reframed)
+
+	cold, cerr := newOrderedLogStore(root)
+	if cerr != nil {
+		t.Fatalf("reopen: %v", cerr)
+	}
+	defer func() {
+		if err := cold.Close(); err != nil {
+			t.Errorf("close cold store: %v", err)
+		}
+	}()
+	coldLog, lerr := cold.logFor("sessions")
+	if lerr != nil {
+		t.Fatalf("cold logFor: %v", lerr)
+	}
+	_, rerr := coldLog.replay()
+	if !errors.As(rerr, &lce) {
+		t.Fatalf("disk-damage error = %T %v, want *OrderedLogCorruptError", rerr, rerr)
+	}
+	if !errors.As(rerr, &ce) {
+		t.Fatalf("disk-damage error = %v, want the codec fault to remain unwrappable", rerr)
+	}
+}

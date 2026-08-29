@@ -524,27 +524,153 @@ func TestEncodeOrderedMutationRejects(t *testing.T) {
 	}
 }
 
-// TestOrderedCodecErrorClassification pins the error surface: every fault has a
-// distinct, non-empty message that never embeds payload bytes, and Unwrap
-// exposes the underlying storage validation error where one exists.
+// hostileKeyMarker is embedded in the StableKey the classification test feeds
+// the codec on the identity fault — the only fault a hostile key can reach,
+// since identity is validated before every other field. No error message may
+// echo it: a StableKey is arbitrary user data (credentials, personal data, an
+// injection payload) and logging it would leak.
+const hostileKeyMarker = "HOSTILE-KEY-\u00dcn\u00efc\u00f6d\u00e9"
+
+// TestOrderedCodecErrorClassification pins the error surface: EVERY fault has a
+// distinct, non-empty, fsstore-prefixed message that never embeds payload bytes,
+// and Unwrap exposes the underlying storage validation error where one exists.
 func TestOrderedCodecErrorClassification(t *testing.T) {
 	t.Parallel()
+
+	// A key long enough to be rejected, carrying the hostile marker.
+	hostileKey := storage.StableKey(hostileKeyMarker + strings.Repeat("z", storage.MaxStableKeyBytes))
+	goldenPayload := mustHex(t, goldenOrderedPayloadHex)
+	withByte := func(off int, b byte) []byte {
+		out := append([]byte{}, goldenPayload...)
+		out[off] = b
+		return out
+	}
+
+	tests := []struct {
+		name  string
+		fault OrderedCodecFault
+		// err produces the error through the REAL codec, so the table cannot
+		// drift from what a caller actually sees.
+		err func(t *testing.T) error
+		// unwrapsStorage asserts a storage validation error is reachable.
+		unwrapsStorage bool
+	}{
+		{
+			name:  "short payload",
+			fault: OrderedFaultShortPayload,
+			err: func(t *testing.T) error {
+				_, err := decodeOrderedMutation(make([]byte, orderedMutationHeaderSize-1))
+				return err
+			},
+		},
+		{
+			name:  "unknown version",
+			fault: OrderedFaultUnknownVersion,
+			err: func(t *testing.T) error {
+				_, err := decodeOrderedMutation(withByte(offOrderedVersion, orderedMutationVersion+1))
+				return err
+			},
+		},
+		{
+			name:  "unknown op",
+			fault: OrderedFaultUnknownOp,
+			err: func(t *testing.T) error {
+				_, err := decodeOrderedMutation(withByte(offOrderedOp, 9))
+				return err
+			},
+		},
+		{
+			name:  "field oversize",
+			fault: OrderedFaultFieldOversize,
+			err: func(t *testing.T) error {
+				// Identity is validated FIRST, so this case keeps a legal key:
+				// a hostile one would short-circuit to an identity fault.
+				m := goldenOrderedMutation()
+				m.Value = make([]byte, storage.MaxOrderedValueBytes+1)
+				_, err := encodeOrderedMutation(m)
+				return err
+			},
+			unwrapsStorage: true,
+		},
+		{
+			name:  "trailing bytes",
+			fault: OrderedFaultTrailingBytes,
+			err: func(t *testing.T) error {
+				_, err := decodeOrderedMutation(append(append([]byte{}, goldenPayload...), 0x00))
+				return err
+			},
+		},
+		{
+			name:  "invalid identity",
+			fault: OrderedFaultInvalidIdentity,
+			err: func(t *testing.T) error {
+				m := goldenOrderedMutation()
+				m.StableKey = hostileKey
+				_, err := encodeOrderedMutation(m)
+				return err
+			},
+			unwrapsStorage: true,
+		},
+		{
+			name:  "invalid record",
+			fault: OrderedFaultInvalidRecord,
+			err: func(t *testing.T) error {
+				m := goldenOrderedMutation()
+				m.Revision = 0
+				_, err := encodeOrderedMutation(m)
+				return err
+			},
+		},
+	}
+
+	seen := make(map[string]string, len(tests)+1)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.err(t)
+			var ce *OrderedCodecError
+			if !errors.As(err, &ce) {
+				t.Fatalf("want *OrderedCodecError, got %T: %v", err, err)
+			}
+			if ce.Fault != tt.fault {
+				t.Fatalf("fault = %d, want %d", ce.Fault, tt.fault)
+			}
+			msg := ce.Error()
+			if msg == "" {
+				t.Fatal("empty message")
+			}
+			if !strings.HasPrefix(msg, "fsstore: ordered mutation ") {
+				t.Errorf("Error() = %q, want an fsstore-prefixed ordered-mutation message", msg)
+			}
+			if strings.Contains(msg, hostileKeyMarker) {
+				t.Errorf("Error() = %q leaks stable key bytes", msg)
+			}
+			if tt.unwrapsStorage && errors.Unwrap(ce) == nil {
+				t.Error("fault carried no unwrappable storage validation error")
+			}
+			// Distinctness is asserted serially, so no subtest runs in parallel
+			// here; the table itself is cheap.
+			if prior, dup := seen[msg]; dup {
+				t.Errorf("message %q is shared with %q", msg, prior)
+			}
+			seen[msg] = tt.name
+		})
+	}
+
+	// The empty StableKey is the one identity fault whose cause is a
+	// *storage.InvalidStableKeyError; pin that it stays unwrappable.
 	m := goldenOrderedMutation()
 	m.StableKey = ""
 	_, err := encodeOrderedMutation(m)
-	var ce *OrderedCodecError
-	if !errors.As(err, &ce) {
-		t.Fatalf("want *OrderedCodecError, got %T: %v", err, err)
-	}
 	var ike *storage.InvalidStableKeyError
 	if !errors.As(err, &ike) {
 		t.Fatalf("want an unwrappable *storage.InvalidStableKeyError, got %v", err)
 	}
-	if !strings.Contains(ce.Error(), "fsstore: ordered mutation") {
-		t.Errorf("Error() = %q, want an fsstore-prefixed ordered-mutation message", ce.Error())
-	}
+
 	unknown := &OrderedCodecError{Fault: OrderedCodecFault(200)}
 	if unknown.Error() == "" {
 		t.Error("unknown fault produced an empty message")
+	}
+	if prior, dup := seen[unknown.Error()]; dup {
+		t.Errorf("unknown-fault message is shared with %q", prior)
 	}
 }

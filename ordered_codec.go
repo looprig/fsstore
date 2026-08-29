@@ -192,6 +192,22 @@ const (
 //
 // The Error() text carries only field names and integers, never payload bytes:
 // a StableKey may be arbitrary user data and must not be echoed into logs.
+//
+// # Classification precedence
+//
+// This one type reports two different things, and the wrapper is what tells them
+// apart. An append REJECTING a caller's mutation returns a BARE
+// *OrderedCodecError; a replay finding the same fault ON DISK returns it wrapped
+// in an *OrderedLogCorruptError. errors.As(&OrderedCodecError) therefore matches
+// both, and a caller that must distinguish invalid input from a damaged log has
+// to test *OrderedLogCorruptError FIRST.
+//
+// A public API whose contract names a specific error for bad input — such as
+// OrderedIndex.CreateOrdered, which owes *storage.InvalidNameError or
+// *storage.InvalidStableKeyError for a malformed OrderedID — must not rely on
+// this precedence at all. It should validate the caller's ID up front with
+// storage.ValidateOrderedID and return THAT error unwrapped, leaving the codec's
+// validation as the internal backstop it is.
 type OrderedCodecError struct {
 	Fault OrderedCodecFault
 	// Field names the implicated field ("stable_key", "value", ...) when the
@@ -238,7 +254,8 @@ func (e *OrderedCodecError) Error() string {
 func (e *OrderedCodecError) Unwrap() error { return e.Cause }
 
 // causeText renders an optional cause for an error message without an fmt
-// dependency, substituting a fixed rule description when there is no cause.
+// dependency, substituting a fixed rule description when there is no cause. It
+// is what keeps every Error() in this package nil-safe.
 func causeText(cause error) string {
 	if cause == nil {
 		return "violates the ordered record contract"

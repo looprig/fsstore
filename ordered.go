@@ -96,6 +96,12 @@ var errOrderedNonContiguousSeq = errors.New("fsstore: non-contiguous ordered log
 // Unlike a torn tail this is not recoverable by truncation, so every operation
 // fails closed. Cause carries the underlying *FrameError, *OrderedCodecError, or
 // errOrderedNonContiguousSeq.
+//
+// PRECEDENCE: because a codec fault read off the disk is wrapped in this type,
+// errors.As finds BOTH *OrderedLogCorruptError and *OrderedCodecError on one
+// disk-corruption error, while a caller's invalid mutation carries only the
+// codec type. A caller separating "your input was bad" from "the log is damaged"
+// must test *OrderedLogCorruptError FIRST.
 type OrderedLogCorruptError struct {
 	Path  string
 	Seq   uint64
@@ -103,8 +109,10 @@ type OrderedLogCorruptError struct {
 }
 
 func (e *OrderedLogCorruptError) Error() string {
+	// causeText guards a nil Cause: a panic while rendering an error message is
+	// the worst possible time to fail.
 	return "fsstore: ordered log " + strconv.Quote(e.Path) + " corrupt at seq " +
-		strconv.FormatUint(e.Seq, 10) + ": " + e.Cause.Error()
+		strconv.FormatUint(e.Seq, 10) + ": " + causeText(e.Cause)
 }
 
 // Unwrap exposes the underlying frame fault, codec fault, or
@@ -147,7 +155,7 @@ type OrderedLogIOError struct {
 }
 
 func (e *OrderedLogIOError) Error() string {
-	return "fsstore: ordered log " + e.Op + " " + strconv.Quote(e.Path) + ": " + e.Cause.Error()
+	return "fsstore: ordered log " + e.Op + " " + strconv.Quote(e.Path) + ": " + causeText(e.Cause)
 }
 
 // Unwrap exposes the underlying filesystem error.
