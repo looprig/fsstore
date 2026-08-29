@@ -322,6 +322,20 @@ func TestLedgerCorruptFailsClosed(t *testing.T) {
 		return writeFrames(t, append(frame1(t), tail...))
 	}
 
+	// ghostSeqZero appends a frame stamped with the never-emitted sequence 0 that
+	// carries a real payload and a correct CRC. It is not a zero region, so it is
+	// not an unwritten tail either: this writer cannot have produced it, and
+	// truncating there would be guessing rather than recovering. Only a seq-0
+	// frame whose whole remainder is zero is recoverable.
+	ghostSeqZero := func(t *testing.T) string {
+		t.Helper()
+		ghost, err := encodeFrame(0, []byte("ghost"))
+		if err != nil {
+			t.Fatalf("encodeFrame 0: %v", err)
+		}
+		return writeFrames(t, append(frame1(t), ghost...))
+	}
+
 	corruptions := []struct {
 		label         string
 		build         func(t *testing.T) string
@@ -333,6 +347,7 @@ func TestLedgerCorruptFailsClosed(t *testing.T) {
 		{label: "oversize length", build: oversize, wantSeq: 2, nonContiguous: false},
 		{label: "non-zero garbage tail", build: nonZeroTail, wantSeq: 2, nonContiguous: false},
 		{label: "half-zero header, wrong seq", build: halfZeroTail, wantSeq: 7, nonContiguous: true},
+		{label: "seq-zero frame carrying a real payload", build: ghostSeqZero, wantSeq: 2, nonContiguous: true},
 	}
 	ops := []struct {
 		label string
@@ -588,17 +603,6 @@ func TestLedgerZeroFilledTailRecovery(t *testing.T) {
 		{"17 zero bytes (unaligned)", func(*testing.T) []byte { return make([]byte, 17) }},
 		{"64 zero bytes", func(*testing.T) []byte { return make([]byte, 64) }},
 		{"4096 zero bytes (one block)", func(*testing.T) []byte { return make([]byte, 4096) }},
-		// An explicit seq-0 frame with a real payload and a correct CRC: not a
-		// zero region at all, but still a sequence this writer can never stamp,
-		// because Append always writes tip+1 >= 1.
-		{"explicit seq 0 frame", func(t *testing.T) []byte {
-			t.Helper()
-			f, err := encodeFrame(0, []byte("ghost"))
-			if err != nil {
-				t.Fatalf("encodeFrame 0: %v", err)
-			}
-			return f
-		}},
 	}
 
 	for _, tc := range cases {
@@ -692,5 +696,94 @@ func TestLedgerZeroFilledTailRecovery(t *testing.T) {
 				}
 			})
 		})
+	}
+}
+
+// TestLedgerMidFileZeroRegionFailsClosed is scanFrames' half of the same rule
+// TestOrderedMidFileZeroRegionFailsClosed pins for the mutation log: a zero
+// region is an unwritten TAIL only if it runs to the end of the file. Anywhere
+// else it is damage that destroyed an acknowledged record, and every entry point
+// must fail closed rather than report a shorter ledger and let the next append
+// make the loss permanent.
+func TestLedgerMidFileZeroRegionFailsClosed(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	const name = "sessions/holed"
+	payloads := [][]byte{[]byte("one"), []byte("two"), []byte("three"), []byte("four")}
+
+	seed := func(t *testing.T, zero int) (string, string, int64) {
+		t.Helper()
+		root := t.TempDir()
+		s, err := newLedgerStore(root)
+		if err != nil {
+			t.Fatalf("newLedgerStore: %v", err)
+		}
+		for i, p := range payloads {
+			if err := s.Append(ctx, name, uint64(i), p); err != nil {
+				t.Fatalf("seed Append %d: %v", i, err)
+			}
+		}
+		path := ledgerFilePath(root, name)
+		data, rerr := os.ReadFile(path) //nolint:gosec // test-controlled path
+		if rerr != nil {
+			t.Fatalf("read seeded ledger: %v", rerr)
+		}
+		start := int64(0)
+		for i := 0; i < zero; i++ {
+			start += frameLen(len(payloads[i]))
+		}
+		end := start + frameLen(len(payloads[zero]))
+		for i := start; i < end; i++ {
+			data[i] = 0
+		}
+		if werr := os.WriteFile(path, data, 0o600); werr != nil {
+			t.Fatalf("write holed ledger: %v", werr)
+		}
+		return root, path, int64(len(data))
+	}
+
+	// Zero the THIRD of four frames: a hole with two whole frames behind it.
+	root, path, size := seed(t, 2)
+	s, err := newLedgerStore(root)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	var corrupt *LedgerCorruptError
+
+	tip, terr := s.Tip(ctx, name)
+	if !errors.As(terr, &corrupt) {
+		t.Fatalf("Tip over a mid-file zero region = (%d, %v), want *LedgerCorruptError", tip, terr)
+	}
+	if _, rerr := s.Read(ctx, name, 1); !errors.As(rerr, &corrupt) {
+		t.Fatalf("Read over a mid-file zero region = %v, want *LedgerCorruptError", rerr)
+	}
+	if aerr := s.Append(ctx, name, 4, []byte("five")); !errors.As(aerr, &corrupt) {
+		t.Fatalf("Append over a mid-file zero region = %v, want *LedgerCorruptError", aerr)
+	}
+	// Nothing on any of those paths may shorten the file.
+	st, serr := os.Stat(path)
+	if serr != nil {
+		t.Fatalf("stat: %v", serr)
+	}
+	if st.Size() != size {
+		t.Fatalf("ledger size after failed reads and an append = %d, want %d", st.Size(), size)
+	}
+
+	// A hole followed by a structurally valid, CRC-correct frame is the same
+	// fault: the surviving frame must not be silently dropped either.
+	root2, path2, size2 := seed(t, 1)
+	s2, err2 := newLedgerStore(root2)
+	if err2 != nil {
+		t.Fatalf("reopen: %v", err2)
+	}
+	if tip, terr := s2.Tip(ctx, name); !errors.As(terr, &corrupt) {
+		t.Fatalf("Tip over an early zero region = (%d, %v), want *LedgerCorruptError", tip, terr)
+	}
+	st2, serr2 := os.Stat(path2)
+	if serr2 != nil {
+		t.Fatalf("stat: %v", serr2)
+	}
+	if st2.Size() != size2 {
+		t.Fatalf("ledger size after a failed Tip = %d, want %d", st2.Size(), size2)
 	}
 }

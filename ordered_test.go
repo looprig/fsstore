@@ -371,18 +371,6 @@ func TestOrderedTornTailRecovers(t *testing.T) {
 		{name: "zero-filled tail one byte past a frame header", damage: zeroTail(frameHeaderSize + 1)},
 		{name: "zero-filled tail of 64 bytes", damage: zeroTail(64)},
 		{name: "zero-filled tail of a whole 4 KiB block", damage: zeroTail(4096)},
-		{
-			name: "tail frame stamped with the never-emitted sequence zero",
-			damage: func(t *testing.T, path string, goodEnd, fullEnd int64) {
-				t.Helper()
-				frame, eerr := encodeOrderedFrame(0, createMutation("host", "gamma", 3))
-				if eerr != nil {
-					t.Fatalf("encode seq-0 frame: %v", eerr)
-				}
-				data := readFile(t, path)
-				writeFile(t, path, append(data[:goodEnd:goodEnd], frame...))
-			},
-		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -523,6 +511,22 @@ func TestOrderedCorruptionFailsClosed(t *testing.T) {
 				}
 				copy(data, reframed)
 				writeFile(t, path, data)
+			},
+		},
+		{
+			// A frame stamped with the never-emitted sequence 0 that carries a
+			// real payload and a correct CRC is NOT a zero region, so it is not
+			// an unwritten tail either: something other than this writer produced
+			// it, and truncating there would be guessing. Only a seq-0 frame
+			// whose whole remainder is zero is recoverable.
+			name:              "seq-zero frame carrying a real payload",
+			appendFailsClosed: true,
+			corrupt: func(t *testing.T, path string) {
+				frame, eerr := encodeOrderedFrame(0, createMutation("host", "ghost", 3))
+				if eerr != nil {
+					t.Fatalf("encode seq-0 frame: %v", eerr)
+				}
+				writeFile(t, path, append(readFile(t, path), frame...))
 			},
 		},
 		{
@@ -2726,5 +2730,79 @@ func TestOrderedIndexDuplicateCreateIgnoresTheCandidate(t *testing.T) {
 	}
 	if again.Revision != tombstone.Revision || !again.Deleted {
 		t.Fatalf("Create over a tombstone returned %+v, want %+v", again, tombstone)
+	}
+}
+
+// frameBounds walks data as a concatenation of frames and returns the byte
+// offset of the START of each one, plus the offset just past the last. It is a
+// test-only reader of the on-disk layout, used to damage a frame in the MIDDLE
+// of a log rather than at its tail.
+func frameBounds(t *testing.T, data []byte) []int {
+	t.Helper()
+	bounds := []int{0}
+	off := 0
+	for off < len(data) {
+		_, _, n, err := decodeFrame(data[off:])
+		if err != nil {
+			t.Fatalf("decode frame at %d: %v", off, err)
+		}
+		off += n
+		bounds = append(bounds, off)
+	}
+	return bounds
+}
+
+// TestOrderedMidFileZeroRegionFailsClosed pins the difference between a zero
+// TAIL, which is an unwritten region a crash left behind and which recovery may
+// truncate, and a zero region in the MIDDLE of a log, which is damage that
+// destroyed an ACKNOWLEDGED mutation.
+//
+// The two are told apart by one thing only: whether the zero region runs to the
+// end of the file. Without that check a hole punched anywhere — by a bad block,
+// an overlay/NFS anomaly, or a partially-rewritten file — reads as end-of-stream,
+// and because every read path may truncate, a single READ makes the loss
+// permanent and frees the acceptance orders of the discarded records for reuse.
+func TestOrderedMidFileZeroRegionFailsClosed(t *testing.T) {
+	t.Parallel()
+	x, root := newTestOrderedIndex(t)
+	ctx := context.Background()
+	keys := []storage.StableKey{"a", "b", "c", "d"}
+	for _, key := range keys {
+		if _, _, err := x.Create(ctx, orderedID("host", key), "catalog", []byte(key), storage.Rank{}, storage.Due{}); err != nil {
+			t.Fatalf("Create(%q): %v", key, err)
+		}
+	}
+	path := filepath.Join(root, orderedDirName, "sessions"+orderedLogExt)
+	data := readFile(t, path)
+	bounds := frameBounds(t, data)
+	if len(bounds) != len(keys)+1 {
+		t.Fatalf("log holds %d frames, want %d", len(bounds)-1, len(keys))
+	}
+	// Zero the THIRD frame in place: the file keeps its length, so the zero
+	// region is provably not a tail.
+	for i := bounds[2]; i < bounds[3]; i++ {
+		data[i] = 0
+	}
+	writeFile(t, path, data)
+	wantSize := int64(len(data))
+
+	cold := openTestOrderedIndex(t, root)
+	page, err := cold.ListOrdered(ctx, "sessions", "host", 0, 10)
+	var corrupt *OrderedLogCorruptError
+	if !errors.As(err, &corrupt) {
+		t.Fatalf("ListOrdered over a mid-file zero region = (%d records, %v), want *OrderedLogCorruptError",
+			len(page.Records), err)
+	}
+	// A READ must not destroy durable data: the file is exactly as it was.
+	if size := fileSize(t, path); size != wantSize {
+		t.Fatalf("log size after a failed read = %d, want %d: a read truncated the file", size, wantSize)
+	}
+	// And the failure is sticky rather than a one-off that later reads paper over.
+	if _, again := cold.ListOrdered(ctx, "sessions", "host", 0, 10); !errors.As(again, &corrupt) {
+		t.Fatalf("second read over a mid-file zero region = %v, want the same failure", again)
+	}
+	// The acceptance order of a discarded record must never be handed out again.
+	if _, created, cerr := cold.Create(ctx, orderedID("host", "c"), "catalog", []byte("c"), storage.Rank{}, storage.Due{}); !errors.As(cerr, &corrupt) {
+		t.Fatalf("Create over a mid-file zero region = (created %t, %v), want *OrderedLogCorruptError", created, cerr)
 	}
 }

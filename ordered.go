@@ -630,8 +630,15 @@ func scanOrderedLog(data []byte, path string, decode bool, expect uint64) (mutat
 			return nil, 0, 0, &OrderedLogCorruptError{Path: path, Seq: expect, Cause: derr}
 		}
 		if seq == 0 {
-			// Never emitted by this writer: an unwritten (zero-filled) tail, not
-			// a committed frame. Belt and braces alongside the all-zero check.
+			// Never emitted by this writer, so this is not a committed frame —
+			// but "not committed" only means "unwritten TAIL" if the zeros run
+			// to the end of the file. A zero region with data behind it is a
+			// HOLE where an acknowledged frame used to be, and truncating there
+			// would discard every frame after it (and free their acceptance
+			// orders for reuse) on a path a plain read can take.
+			if !allZero(data[off:]) {
+				return nil, 0, 0, &OrderedLogCorruptError{Path: path, Seq: expect, Cause: errOrderedNonContiguousSeq}
+			}
 			return mutations, lastSeq, int64(off), nil
 		}
 		if seq != expect {

@@ -515,8 +515,14 @@ func scanFrames(data []byte, path string) (lastSeq uint64, goodEnd int64, err er
 			return 0, 0, &LedgerCorruptError{Path: path, Seq: expect, Cause: derr}
 		}
 		if seq == 0 {
-			// Never emitted by this writer: an unwritten (zero-filled) tail, not
-			// a committed frame. Belt and braces alongside the all-zero check.
+			// Never emitted by this writer, so this is not a committed frame —
+			// but "not committed" only means "unwritten TAIL" if the zeros run
+			// to the end of the file. A zero region with data behind it is a
+			// HOLE where an acknowledged record used to be, and truncating there
+			// would discard every record after it on a path a plain Tip can take.
+			if !allZero(data[off:]) {
+				return 0, 0, &LedgerCorruptError{Path: path, Seq: expect, Cause: errNonContiguousSeq}
+			}
 			return lastSeq, int64(off), nil
 		}
 		if seq != expect {
