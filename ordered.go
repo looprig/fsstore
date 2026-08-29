@@ -394,10 +394,13 @@ func (l *orderedLog) replay(ctx context.Context) (mutations []orderedMutation, e
 // cannot read.
 //
 // ctx is checked once, before any lock is taken, and not again — see replay for
-// why. A non-nil error with a NONZERO seq means the frame WAS committed and
-// fsynced and only the close or unlock that followed failed; the caller must not
-// treat that as "nothing happened" and retry, which for CreateOrdered would burn
-// a second order for one identity.
+// why.
+//
+// The seq return is meaningful ON ERROR. A non-nil error with a NONZERO seq
+// means the frame WAS committed and fsynced and a step AFTER it failed — the
+// ancestor directory fsync, the close, or the unlock. The caller must not read
+// that as "nothing happened" and retry: for CreateOrdered a retry would burn a
+// second order for one identity. Only a zero seq means nothing was written.
 func (l *orderedLog) append(ctx context.Context, m orderedMutation) (seq uint64, err error) {
 	if cerr := ctx.Err(); cerr != nil {
 		return 0, cerr
@@ -458,16 +461,22 @@ func (l *orderedLog) append(ctx context.Context, m orderedMutation) (seq uint64,
 	if serr := f.Sync(); serr != nil {
 		return 0, &OrderedLogIOError{Op: "fsync", Path: l.path, Cause: serr}
 	}
+	// The frame is now on the disk and fsynced, so the cache advances HERE,
+	// before the last durability step. Everything after this point can fail
+	// without the frame ceasing to exist, and the returned seq has to say so.
+	l.tip++
+	l.size += int64(len(frame))
 	if created {
 		// A nested namespace (factory/hosts) creates directories several levels
 		// deep, so fsync the chain from the file's directory up to and including
 		// <root>/ordered.
 		if derr := fsyncDirChain(dir, l.stopDir, orderedIOErr); derr != nil {
-			return 0, derr
+			// The frame is committed; only the durability of the new directory
+			// entries is in doubt. Report both facts: the error, and the seq
+			// that says a retry would duplicate the mutation, not replace it.
+			return l.tip, derr
 		}
 	}
-	l.tip++
-	l.size += int64(len(frame))
 	return l.tip, nil
 }
 

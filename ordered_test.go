@@ -1340,3 +1340,84 @@ func TestOrderedLogHonorsCancellationBeforeWork(t *testing.T) {
 		t.Errorf("a cancelled call modified the log: %d bytes -> %d bytes", len(before), len(after))
 	}
 }
+
+// TestOrderedFirstAppendFsyncsTheDirectoryChain asserts that the ancestor
+// directory fsync happens on the FIRST append to a namespace and not on later
+// ones. It cannot prove durability — that needs crash injection, the same
+// limitation the file's f.Sync() carries — but it does prove the chain is
+// walked, and when: the observable is that a directory the process cannot OPEN
+// fails a creating append (fsyncDir must open it) and does not disturb a
+// non-creating one.
+//
+// Skipped for root, which bypasses the permission bits the test depends on.
+func TestOrderedFirstAppendFsyncsTheDirectoryChain(t *testing.T) {
+	t.Parallel()
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: directory permissions are not enforced")
+	}
+	store, root := newTestOrderedLogStore(t)
+	const namespace = "factory/hosts"
+	log, err := store.logFor(namespace)
+	if err != nil {
+		t.Fatalf("logFor: %v", err)
+	}
+	logPath := filepath.Join(root, orderedDirName, "factory", "hosts"+orderedLogExt)
+	leafDir := filepath.Dir(logPath)
+	// append's own MkdirAll is idempotent, so pre-creating the directory changes
+	// nothing except that the test can adjust its permissions first.
+	if merr := os.MkdirAll(leafDir, 0o700); merr != nil {
+		t.Fatalf("mkdir %s: %v", leafDir, merr)
+	}
+
+	// A write+traverse-only directory: the log file can still be created and
+	// written inside it, but it cannot be opened for the fsync.
+	unreadable := func() {
+		if cerr := os.Chmod(leafDir, 0o300); cerr != nil {
+			t.Fatalf("chmod %s: %v", leafDir, cerr)
+		}
+	}
+	readable := func() {
+		if cerr := os.Chmod(leafDir, 0o700); cerr != nil {
+			t.Fatalf("chmod %s: %v", leafDir, cerr)
+		}
+	}
+	t.Cleanup(readable)
+
+	// First append (the log is absent, so created is true): the chain fsync runs
+	// and must surface the failure as a typed IO error rather than being skipped.
+	unreadable()
+	var ioErr *OrderedLogIOError
+	seq, aerr := log.append(context.Background(), createMutation("host", "alpha", 1))
+	if aerr == nil {
+		t.Fatalf("creating append succeeded at seq %d despite an unopenable directory", seq)
+	}
+	if !errors.As(aerr, &ioErr) {
+		t.Fatalf("creating append error = %T %v, want *OrderedLogIOError", aerr, aerr)
+	}
+	if ioErr.Op != "open-dir" {
+		t.Fatalf("creating append error op = %q, want %q", ioErr.Op, "open-dir")
+	}
+	// The frame itself was written and fsynced before the directory chain, so
+	// the seq must be reported alongside the error: a caller that retried here
+	// would duplicate the mutation, not replace it.
+	if seq != 1 {
+		t.Errorf("failed creating append returned seq %d, want 1 (the frame is committed)", seq)
+	}
+
+	// With the directory readable an append succeeds, continuing the sequence.
+	readable()
+	if got := mustAppend(t, log, createMutation("host", "beta", 2)); got != 2 {
+		t.Errorf("append after the fsync failure = seq %d, want 2", got)
+	}
+
+	// A LATER append finds a non-empty log, so created is false and the chain
+	// fsync is skipped: the unopenable directory no longer matters.
+	unreadable()
+	if got, err := log.append(context.Background(), createMutation("host", "gamma", 3)); err != nil {
+		t.Fatalf("non-creating append = (%d, %v), want success (the dir fsync must be skipped)", got, err)
+	}
+	readable()
+	if got := mustReplay(t, log); len(got) != 3 {
+		t.Fatalf("replayed %d mutations, want 3", len(got))
+	}
+}
