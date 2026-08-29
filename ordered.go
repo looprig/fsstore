@@ -296,7 +296,7 @@ func (l *orderedLog) replay() (mutations []orderedMutation, err error) {
 		}
 	}()
 
-	decoded, rerr := l.recover(f)
+	decoded, rerr := l.recover(f, true)
 	if rerr != nil {
 		return nil, rerr
 	}
@@ -380,8 +380,12 @@ func (l *orderedLog) append(m orderedMutation) (seq uint64, err error) {
 }
 
 // refresh brings the cached tip/size in sync with the on-disk file for the
-// append path, which does not need the decoded mutations. The fast path skips
-// the scan entirely when the cache is valid and the file size is unchanged.
+// append path, which does not need the decoded mutations — so it re-scans with
+// decode false and never materializes the log's history. The fast path skips the
+// scan entirely when the cache is valid and the file size is unchanged; the
+// cross-process path, where a second writer's append changes the size, misses
+// that fast path on EVERY call, which is exactly why the re-scan must stay at
+// the frame layer (see scanOrderedLog).
 //
 // The size-equality fast path is sound under the same single-writer-per-namespace
 // assumption the ledger documents: it detects a cross-process change by size
@@ -395,18 +399,18 @@ func (l *orderedLog) refresh(f *os.File) error {
 	if l.loaded && st.Size() == l.size {
 		return nil
 	}
-	_, err := l.recover(f)
+	_, err := l.recover(f, false)
 	return err
 }
 
 // recover scans the whole file, truncates a torn tail back to the last whole
-// frame, updates the cached tip/size, and returns the decoded mutations in
-// append order. It is called only under both the per-namespace mutex and the
-// advisory lock, so the file is quiescent.
+// frame, updates the cached tip/size, and — when decode is true — returns the
+// decoded mutations in append order. It is called only under both the
+// per-namespace mutex and the advisory lock, so the file is quiescent.
 //
 // On any error the cache is left UNLOADED, so a later operation re-scans rather
 // than trusting metadata derived from an unreadable file.
-func (l *orderedLog) recover(f *os.File) ([]orderedMutation, error) {
+func (l *orderedLog) recover(f *os.File, decode bool) ([]orderedMutation, error) {
 	l.loaded = false
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return nil, &OrderedLogIOError{Op: "seek", Path: l.path, Cause: err}
@@ -415,7 +419,7 @@ func (l *orderedLog) recover(f *os.File) ([]orderedMutation, error) {
 	if rerr != nil {
 		return nil, &OrderedLogIOError{Op: "read", Path: l.path, Cause: rerr}
 	}
-	mutations, lastSeq, goodEnd, scerr := scanOrderedFrames(data, l.path)
+	mutations, lastSeq, goodEnd, scerr := scanOrderedLog(data, l.path, decode)
 	if scerr != nil {
 		return nil, scerr // fail closed: corruption truncation cannot repair
 	}
@@ -435,31 +439,82 @@ func (l *orderedLog) recover(f *os.File) ([]orderedMutation, error) {
 	return mutations, nil
 }
 
-// scanOrderedFrames walks the concatenated frames in data, decoding each
-// mutation and verifying that sequences are contiguous from 1. It returns the
-// mutations in append order, the last good sequence, and goodEnd — the byte
-// offset just past the last whole frame.
+// allZero reports whether every byte of b is zero. It is only ever called once
+// per scan, on the fault path, so the walk stays linear in the file size.
+func allZero(b []byte) bool {
+	for _, c := range b {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// scanOrderedLog walks the concatenated frames in data and verifies that
+// sequences are contiguous from 1. It returns the last good sequence and
+// goodEnd — the byte offset just past the last whole frame — plus, when decode
+// is true, every mutation in append order.
 //
-// A torn tail (an incomplete final frame) stops the walk cleanly at goodEnd and
-// is recoverable by truncation. Every other fault — a checksum mismatch, an
-// over-ceiling declared length, a frame that decodes to an illegal mutation, or a
-// sequence gap — returns an *OrderedLogCorruptError and no mutations.
-func scanOrderedFrames(data []byte, path string) (mutations []orderedMutation, lastSeq uint64, goodEnd int64, err error) {
+// decode is the append/replay split. replay needs the mutations; append needs
+// only the tip and goodEnd, so it passes false and the walk stops at the FRAME
+// layer, paying CRC and sequence verification without materializing a mutation
+// (and its scope/key/value allocations) per frame. The stated tradeoff: a
+// structure-only walk no longer catches a CRC-valid frame carrying an illegal
+// payload, so on the append path "a writer must never extend a log it cannot
+// read" weakens to "...whose FRAMING it cannot read". That is the ledger's
+// existing bargain, and it is the right one: the alternative is a fully quadratic
+// append (every append decoding all history) with unbounded memory whenever the
+// cross-process path misses the size-equality fast path — which is every append
+// when two writers share a namespace, the configuration the flock exists for.
+// replay still validates every payload, so an illegal frame fails closed at the
+// next open.
+//
+// A torn tail stops the walk cleanly at goodEnd and is recoverable by
+// truncation. Three artifacts are torn:
+//
+//   - an incomplete final frame (the frame layer reports it short);
+//   - a frame stamped with sequence 0, which this writer can never emit because
+//     append always stamps l.tip+1 >= 1;
+//   - a trailing region that is entirely zero. This is the most common
+//     post-crash artifact of all — a filesystem that journalled the new file
+//     size before the data blocks leaves the extended region reading as zeros —
+//     and it is NOT self-evidently torn: 16 zero bytes decode as a structurally
+//     valid frame (len 0, crc 0, and crc32c of an empty payload is exactly 0)
+//     whose empty payload then fails the codec. Classifying that as corruption
+//     would brick the namespace: replay fails, append fails closed, and there is
+//     no repair path. The seq-0 rule already covers an aligned zero region; the
+//     explicit all-zero check covers an unaligned one.
+//
+// Every other fault — a checksum mismatch, an over-ceiling declared length, a
+// frame that decodes to an illegal mutation, or a sequence gap — returns an
+// *OrderedLogCorruptError and no mutations.
+func scanOrderedLog(data []byte, path string, decode bool) (mutations []orderedMutation, lastSeq uint64, goodEnd int64, err error) {
 	off := 0
 	var expect uint64 = 1
 	for off < len(data) {
-		seq, m, n, derr := decodeOrderedFrame(data[off:])
+		seq, payload, n, derr := decodeFrame(data[off:])
 		if derr != nil {
 			var fe *FrameError
-			if errors.As(derr, &fe) && fe.IsTorn() {
+			if (errors.As(derr, &fe) && fe.IsTorn()) || allZero(data[off:]) {
 				return mutations, lastSeq, int64(off), nil // torn tail: good up to off
 			}
 			return nil, 0, 0, &OrderedLogCorruptError{Path: path, Seq: expect, Cause: derr}
 		}
+		if seq == 0 {
+			// Never emitted by this writer: an unwritten (zero-filled) tail, not
+			// a committed frame. Belt and braces alongside the all-zero check.
+			return mutations, lastSeq, int64(off), nil
+		}
 		if seq != expect {
 			return nil, 0, 0, &OrderedLogCorruptError{Path: path, Seq: seq, Cause: errOrderedNonContiguousSeq}
 		}
-		mutations = append(mutations, m)
+		if decode {
+			m, cerr := decodeOrderedMutation(payload)
+			if cerr != nil {
+				return nil, 0, 0, &OrderedLogCorruptError{Path: path, Seq: seq, Cause: cerr}
+			}
+			mutations = append(mutations, m)
+		}
 		off += n
 		lastSeq = seq
 		expect++

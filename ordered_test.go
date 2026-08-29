@@ -310,20 +310,69 @@ func TestOrderedLogRejectsUnwritableStableKey(t *testing.T) {
 	}
 }
 
+// cutTail models an interrupted write that stopped mid-frame: the trailing n
+// bytes of the file are simply absent. It is the EASY tear — the frame layer
+// reports it as short and the recovery path is obvious.
+func cutTail(n int) func(t *testing.T, path string, goodEnd, fullEnd int64) {
+	return func(t *testing.T, path string, goodEnd, fullEnd int64) {
+		t.Helper()
+		if int64(n) >= fullEnd-goodEnd {
+			t.Fatalf("cut %d would remove a whole frame, not tear one", n)
+		}
+		if terr := os.Truncate(path, fullEnd-int64(n)); terr != nil {
+			t.Fatalf("truncate: %v", terr)
+		}
+	}
+}
+
+// zeroTail models the far more common post-crash artifact: a filesystem that
+// journalled the file's new SIZE before its data blocks, so the extended region
+// reads back as zeros. Sixteen zero bytes are a STRUCTURALLY VALID frame — len
+// 0, crc 0 (crc32c of nothing is exactly 0), seq 0 — so the frame layer accepts
+// them and the tail is only recognizable by the sequence this writer can never
+// emit. Getting this wrong bricks the namespace permanently: the log is declared
+// corrupt, replay and append both fail closed, and the module has no repair path.
+func zeroTail(n int) func(t *testing.T, path string, goodEnd, fullEnd int64) {
+	return func(t *testing.T, path string, goodEnd, fullEnd int64) {
+		t.Helper()
+		data := readFile(t, path)
+		writeFile(t, path, append(data[:goodEnd:goodEnd], make([]byte, n)...))
+	}
+}
+
 // TestOrderedTornTailRecovers models a crash mid-append: the log ends with a
-// partial frame. Replay must roll the file back to the last whole frame, keep
-// every complete mutation, physically truncate the tail, and let the next append
-// continue the sequence from there.
+// partial or unwritten frame. Replay must roll the file back to the last whole
+// frame, keep every complete mutation, physically truncate the tail, and let the
+// next append continue the sequence from there.
 func TestOrderedTornTailRecovers(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name string
-		// cut is the number of trailing bytes to remove from the third frame.
-		cut int
+		// damage rewrites the log's tail to model one crash artifact. The file
+		// holds two committed frames ending at goodEnd plus a whole third frame
+		// ending at fullEnd; damage must leave the first goodEnd bytes intact.
+		damage func(t *testing.T, path string, goodEnd, fullEnd int64)
 	}{
-		{name: "one byte of payload lost", cut: 1},
-		{name: "most of the payload lost", cut: 20},
-		{name: "header partially written", cut: frameHeaderSize + orderedMutationHeaderSize - 4},
+		{name: "one byte of payload lost", damage: cutTail(1)},
+		{name: "most of the payload lost", damage: cutTail(20)},
+		{name: "header partially written", damage: cutTail(frameHeaderSize + orderedMutationHeaderSize - 4)},
+		{name: "zero-filled tail shorter than a frame header", damage: zeroTail(frameHeaderSize - 1)},
+		{name: "zero-filled tail of exactly one frame header", damage: zeroTail(frameHeaderSize)},
+		{name: "zero-filled tail one byte past a frame header", damage: zeroTail(frameHeaderSize + 1)},
+		{name: "zero-filled tail of 64 bytes", damage: zeroTail(64)},
+		{name: "zero-filled tail of a whole 4 KiB block", damage: zeroTail(4096)},
+		{
+			name: "tail frame stamped with the never-emitted sequence zero",
+			damage: func(t *testing.T, path string, goodEnd, fullEnd int64) {
+				t.Helper()
+				frame, eerr := encodeOrderedFrame(0, createMutation("host", "gamma", 3))
+				if eerr != nil {
+					t.Fatalf("encode seq-0 frame: %v", eerr)
+				}
+				data := readFile(t, path)
+				writeFile(t, path, append(data[:goodEnd:goodEnd], frame...))
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -348,12 +397,7 @@ func TestOrderedTornTailRecovers(t *testing.T) {
 			if fullEnd <= goodEnd {
 				t.Fatalf("third append did not grow the log: %d -> %d", goodEnd, fullEnd)
 			}
-			if int64(tt.cut) >= fullEnd-goodEnd {
-				t.Fatalf("cut %d would remove a whole frame, not tear one", tt.cut)
-			}
-			if terr := os.Truncate(logPath, fullEnd-int64(tt.cut)); terr != nil {
-				t.Fatalf("truncate: %v", terr)
-			}
+			tt.damage(t, logPath, goodEnd, fullEnd)
 
 			// A cold store must not see the partial third mutation.
 			cold, cerr := newOrderedLogStore(root)
@@ -397,27 +441,40 @@ func TestOrderedTornTailRecovers(t *testing.T) {
 
 // TestOrderedCorruptionFailsClosed models damage that truncation cannot repair.
 // Unlike a torn tail, every declared byte is present, so the log must refuse to
-// replay or append rather than silently drop or misread a committed mutation.
+// replay rather than silently drop or misread a committed mutation.
+//
+// appendFailsClosed records where the append path draws its line. Append
+// re-scans at the FRAME layer only (see scanOrderedLog), so it refuses to extend
+// a log whose framing it cannot read — but a CRC-valid frame carrying an illegal
+// PAYLOAD is invisible to it. That is the deliberate cost of keeping append
+// linear rather than re-decoding all history on every cross-process call; the
+// damage is not buried either way, because replay still fails closed afterwards.
 func TestOrderedCorruptionFailsClosed(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name    string
-		corrupt func(t *testing.T, path string)
+		name              string
+		appendFailsClosed bool
+		corrupt           func(t *testing.T, path string)
 	}{
 		{
-			name: "checksum mismatch in a committed frame",
+			name:              "checksum mismatch in a committed frame",
+			appendFailsClosed: true,
 			corrupt: func(t *testing.T, path string) {
 				flipByte(t, path, frameHeaderSize+orderedMutationHeaderSize)
 			},
 		},
 		{
-			name: "checksum mismatch in the first frame header",
+			name:              "checksum mismatch in the first frame header",
+			appendFailsClosed: true,
 			corrupt: func(t *testing.T, path string) {
 				flipByte(t, path, 4) // a CRC byte
 			},
 		},
 		{
-			name: "unknown payload version inside a valid frame",
+			// Framing-valid, payload-illegal: replay must fail closed, but the
+			// frame-layer append re-scan cannot see it.
+			name:              "unknown payload version inside a valid frame",
+			appendFailsClosed: false,
 			corrupt: func(t *testing.T, path string) {
 				// Rebuild frame 1 around a payload whose version byte is bumped,
 				// so the CRC agrees and only the codec can reject it.
@@ -439,7 +496,8 @@ func TestOrderedCorruptionFailsClosed(t *testing.T) {
 			},
 		},
 		{
-			name: "non-contiguous frame sequence",
+			name:              "non-contiguous frame sequence",
+			appendFailsClosed: true,
 			corrupt: func(t *testing.T, path string) {
 				// Rewrite frame 1's sequence to 5. The frame header's CRC covers
 				// only the payload, so the frame stays individually valid and the
@@ -458,7 +516,8 @@ func TestOrderedCorruptionFailsClosed(t *testing.T) {
 			},
 		},
 		{
-			name: "garbage appended as a whole oversized frame",
+			name:              "garbage appended as a whole oversized frame",
+			appendFailsClosed: true,
 			corrupt: func(t *testing.T, path string) {
 				data := readFile(t, path)
 				// A declared length beyond MaxFramePayload is corruption, not a
@@ -518,11 +577,25 @@ func TestOrderedCorruptionFailsClosed(t *testing.T) {
 			}
 
 			// Appending must fail closed too — a writer must never extend a log
-			// it cannot read, which would bury the damage under new records.
-			if seq, aerr := coldLog.append(createMutation("host", "gamma", 3)); aerr == nil {
-				t.Errorf("append to a corrupt log succeeded at seq %d, want an error", seq)
-			} else if !errors.As(aerr, &ce) {
-				t.Errorf("append error = %T %v, want *OrderedLogCorruptError", aerr, aerr)
+			// whose framing it cannot read, which would bury the damage under
+			// new records. Payload-level damage is outside what the frame-layer
+			// re-scan can see, and there the requirement is only that the append
+			// does not conceal it: replay must still fail closed afterwards.
+			seq, aerr := coldLog.append(createMutation("host", "gamma", 3))
+			switch {
+			case tt.appendFailsClosed:
+				if aerr == nil {
+					t.Errorf("append to a corrupt log succeeded at seq %d, want an error", seq)
+				} else if !errors.As(aerr, &ce) {
+					t.Errorf("append error = %T %v, want *OrderedLogCorruptError", aerr, aerr)
+				}
+			default:
+				if aerr != nil {
+					t.Errorf("frame-layer-valid log: append = %v, want success", aerr)
+				}
+				if _, rerr2 := coldLog.replay(); !errors.As(rerr2, &ce) {
+					t.Errorf("replay after append = %T %v, want the damage still reported", rerr2, rerr2)
+				}
 			}
 			// Nothing may be silently repaired or discarded: a corrupt log keeps
 			// at least the bytes it had, so an operator can still recover them.
