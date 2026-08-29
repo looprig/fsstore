@@ -1063,11 +1063,15 @@ type orderedDecision struct {
 // reintroduces a second recovery behaviour to keep straight. It is deliberately
 // left for a change that can carry those tests rather than folded in here.
 //
-// ctx may cancel either lock wait before file work begins. The advisory wait
-// polls for the same exclusive LOCK_EX using LOCK_NB, rather than abandoning a
-// goroutine blocked in flock that could later acquire a lock nobody releases.
-// Once both locks are held, ctx is deliberately ignored: abandoning work midway
-// is unsafe for a path that may truncate recovery bytes or durably append.
+// ctx may cancel the namespace wait before filesystem setup, or the advisory
+// wait before recovery/mutation begins. The advisory wait polls for the same
+// exclusive LOCK_EX using LOCK_NB, rather than abandoning a goroutine blocked in
+// flock that could later acquire a lock nobody releases. A fresh mutating call
+// that RETURNS cancellation after MkdirAll/OpenFile may leave an inert namespace
+// directory and zero-length log; it cannot leave a frame, partial frame, or
+// truncation because catchUp and append run only after the advisory lock is
+// acquired. Once both locks are held, ctx is deliberately ignored: abandoning
+// recovery or mutation midway would be unsafe.
 //
 // The seq return is meaningful ON ERROR, and callers must read it: a NONZERO seq
 // with a non-nil error means the frame WAS committed, fsynced, and folded into
@@ -1081,9 +1085,10 @@ func (l *orderedLog) withView(ctx context.Context, mutating bool, fn func(v *ord
 	}
 	defer l.mu.unlock()
 
-	// Acquiring the permit can race cancellation. Recheck immediately before
-	// MkdirAll/OpenFile(O_CREATE), so a caller that cancels while queued cannot
-	// leave a fresh namespace directory or empty log behind.
+	// Acquiring the permit can race cancellation. Cancellation observed by this
+	// recheck leaves no filesystem artifact because MkdirAll/OpenFile(O_CREATE)
+	// have not run. Cancellation after this boundary may leave only their inert
+	// empty artifacts; the file is not scanned or written before advisory lock.
 	if cerr := ctx.Err(); cerr != nil {
 		return 0, cerr
 	}

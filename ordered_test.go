@@ -1619,6 +1619,72 @@ func TestOrderedLogCancellationBeforeFreshNamespaceSetup(t *testing.T) {
 	}
 }
 
+// TestOrderedLogCancellationAfterFreshNamespaceSetupLeavesNoFrame pins the
+// later boundary: once filesystem setup starts, cancellation may leave an inert
+// empty directory/log, but it cannot append even a partial frame or consume a
+// sequence. A later uncancelled create must still commit as frame 1.
+func TestOrderedLogCancellationAfterFreshNamespaceSetupLeavesNoFrame(t *testing.T) {
+	t.Parallel()
+	store, _ := newTestOrderedLogStore(t)
+	log, err := store.logFor("fresh/late-cancel")
+	if err != nil {
+		t.Fatalf("logFor: %v", err)
+	}
+	ctx := &cancelOnErrObservationContext{
+		Context:  context.Background(),
+		cancelAt: 4, // after permit and pre-filesystem check, at advisory acquisition
+		done:     make(chan struct{}),
+	}
+	seq, err := commitMutation(ctx, log, createMutation("host", "alpha", 1))
+	if !errors.Is(err, context.Canceled) || seq != 0 {
+		t.Fatalf("fresh create cancelled after setup = (%d, %T %v), want (0, context.Canceled)", seq, err, err)
+	}
+	data, readErr := os.ReadFile(log.path) // #nosec G304 -- test-local path from t.TempDir
+	if readErr != nil && !errors.Is(readErr, fs.ErrNotExist) {
+		t.Fatalf("read possible empty log: %v", readErr)
+	}
+	if len(data) != 0 {
+		t.Fatalf("cancelled fresh create left %d log bytes, want no frame bytes", len(data))
+	}
+	if got, replayErr := replayMutations(context.Background(), t, log); replayErr != nil || len(got) != 0 {
+		t.Fatalf("replay after cancelled fresh create = (%d mutations, %v), want empty", len(got), replayErr)
+	}
+	if gotSeq, appendErr := commitMutation(context.Background(), log, createMutation("host", "alpha", 1)); appendErr != nil || gotSeq != 1 {
+		t.Fatalf("uncancelled create after inert artifact = (%d, %v), want (1, nil)", gotSeq, appendErr)
+	}
+}
+
+// TestOrderedLogCancellationAfterOpeningExistingNamespaceDoesNotModifyBytes
+// proves the same late cancellation cannot alter, truncate, or extend committed
+// history. Once the cancelled call returns, an uncancelled control still appends
+// the next complete frame.
+func TestOrderedLogCancellationAfterOpeningExistingNamespaceDoesNotModifyBytes(t *testing.T) {
+	t.Parallel()
+	store, root := newTestOrderedLogStore(t)
+	log, err := store.logFor("sessions")
+	if err != nil {
+		t.Fatalf("logFor: %v", err)
+	}
+	mustAppend(t, log, createMutation("host", "alpha", 1))
+	logPath := filepath.Join(root, orderedDirName, "sessions"+orderedLogExt)
+	before := readFile(t, logPath)
+	ctx := &cancelOnErrObservationContext{
+		Context:  context.Background(),
+		cancelAt: 4,
+		done:     make(chan struct{}),
+	}
+	seq, err := commitMutation(ctx, log, createMutation("host", "beta", 2))
+	if !errors.Is(err, context.Canceled) || seq != 0 {
+		t.Fatalf("existing create cancelled after open = (%d, %T %v), want (0, context.Canceled)", seq, err, err)
+	}
+	if after := readFile(t, logPath); !bytes.Equal(after, before) {
+		t.Fatalf("late cancellation modified existing log: %d bytes -> %d bytes", len(before), len(after))
+	}
+	if gotSeq, appendErr := commitMutation(context.Background(), log, createMutation("host", "beta", 2)); appendErr != nil || gotSeq != 2 {
+		t.Fatalf("uncancelled control after late cancellation = (%d, %v), want (2, nil)", gotSeq, appendErr)
+	}
+}
+
 type orderedErrObservedContext struct {
 	context.Context
 	errObserved chan struct{}

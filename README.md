@@ -47,3 +47,9 @@ applies only the new complete tail. Recovery truncates an all-zero unwritten tai
 post-crash case where the filesystem persisted the journal size before its data blocks. A zero
 region that is not at the tail fails closed with `*OrderedLogCorruptError`; no acknowledged record
 is discarded.
+
+An OrderedIndex operation that returns cancellation before filesystem setup leaves no path. If it
+returns cancellation after a fresh namespace directory or log is created but before advisory-lock
+acquisition, it may leave that inert empty artifact, but never a committed or partial frame and
+never a truncation. Once the exclusive advisory lock is held, recovery or mutation completes
+without abandoning durability-critical work midway.
