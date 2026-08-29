@@ -663,7 +663,9 @@ func (v *orderedView) apply(m orderedMutation) error {
 	// Remove under the PREVIOUS record's sort keys before publishing the new one:
 	// the index position is derived from the record's current rank and due time,
 	// so removing after the rewrite would look for the entry in the wrong place.
-	v.removeCurrent(key, previous)
+	if rerr := v.removeCurrent(key, previous); rerr != nil {
+		return rerr
+	}
 	v.records[key] = record
 	v.insertCurrent(key, record)
 	return nil
@@ -689,12 +691,22 @@ func (v *orderedView) insertCurrent(key orderedIdentity, record storage.OrderedR
 }
 
 // removeCurrent drops key from the indexes record participated in.
-func (v *orderedView) removeCurrent(key orderedIdentity, record storage.OrderedRecord) {
+//
+// A record that is ranked, or due, MUST be present in the corresponding index —
+// insertCurrent put it there under the same two conditions, and the record read
+// here is the one the index was built from. A missing entry therefore means the
+// view and its indexes disagree, which is the one thing the indexes exist to
+// rule out, so it is reported rather than skipped: continuing would publish the
+// new record while the stale entry stayed in the sorted slice, and a later page
+// would return a record under sort keys it no longer has.
+func (v *orderedView) removeCurrent(key orderedIdentity, record storage.OrderedRecord) error {
 	if record.Rank.Ranked {
 		entries := v.ranked[record.RankingScope]
-		if position := orderedIdentityPosition(entries, key); position >= 0 {
-			entries = removeOrderedIdentity(entries, position)
+		position := orderedIdentityPosition(entries, key)
+		if position < 0 {
+			return errOrderedInconsistentLog
 		}
+		entries = removeOrderedIdentity(entries, position)
 		if len(entries) == 0 {
 			delete(v.ranked, record.RankingScope)
 		} else {
@@ -702,10 +714,13 @@ func (v *orderedView) removeCurrent(key orderedIdentity, record storage.OrderedR
 		}
 	}
 	if record.Due.State == storage.DueAt {
-		if position := orderedIdentityPosition(v.due, key); position >= 0 {
-			v.due = removeOrderedIdentity(v.due, position)
+		position := orderedIdentityPosition(v.due, key)
+		if position < 0 {
+			return errOrderedInconsistentLog
 		}
+		v.due = removeOrderedIdentity(v.due, position)
 	}
+	return nil
 }
 
 func insertOrderedIdentity(entries []orderedIdentity, position int, key orderedIdentity) []orderedIdentity {
@@ -870,12 +885,21 @@ func (l *orderedLog) catchUp(f *os.File) error {
 	if !l.viewLoaded || size < l.applied {
 		l.resetView()
 	}
-	if l.viewLoaded && size == l.applied {
-		return nil // warm and caught up: not one byte is read
+	span := size - l.applied
+	if span == 0 {
+		// Nothing new to fold. This is the warm caught-up reader — not one byte
+		// is read — and also the cold reader of an empty or absent-then-created
+		// log, which has nothing to rebuild FROM. Neither reads anything, so
+		// neither counts as a catch-up.
+		l.viewLoaded = true
+		return nil
 	}
 	l.catchUps++
 
-	span := size - l.applied
+	// One buffer for the whole unapplied span. For a warm reader that span is
+	// the bytes appended since it last looked, which is invariant 15's whole
+	// point; for a COLD one it is the entire log, and there is no log-size limit
+	// anywhere in this module — see the compaction note at the top of this file.
 	tail := make([]byte, span)
 	if _, rerr := f.ReadAt(tail, l.applied); rerr != nil {
 		l.viewLoaded = false
@@ -968,6 +992,20 @@ type orderedDecision struct {
 // mutating selects two behaviors together, because they belong together: the log
 // file is created if missing, and fn is allowed to return a frame. A read never
 // creates a file, so listing an untouched namespace leaves no trace on disk.
+//
+// A read still opens O_RDWR and still takes LOCK_EX, though, because catch-up
+// may truncate a torn tail and that is a write. Two consequences follow and
+// neither is fixed here. Reads do not run against a read-only store or mount:
+// the open fails with EACCES/EROFS before anything is read. And reads do not run
+// concurrently across processes, because LOCK_EX excludes even other readers.
+//
+// The alternative is a read that stops at goodEnd, leaves the torn tail in place
+// for the next writer to repair — which is what the ledger's Tip and Read
+// already do — and so can take O_RDONLY and LOCK_SH. It is a real improvement
+// and a real change: it re-walks the damaged tail on every read until a write
+// arrives, it needs its own cross-process test for the shared-lock path, and it
+// reintroduces a second recovery behaviour to keep straight. It is deliberately
+// left for a change that can carry those tests rather than folded in here.
 //
 // ctx is checked ONCE, before any lock is taken, and not again — the in-process
 // mutex and the blocking LOCK_EX are not cancellable, and abandoning the file

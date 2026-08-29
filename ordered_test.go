@@ -2601,6 +2601,92 @@ func TestOrderedIndexRejectsInvalidListArguments(t *testing.T) {
 	}
 }
 
+// TestOrderedViewRefusesAnUpdateToAnAbsentIdentity pins the absent-identity
+// check specifically, which no LOG can reach: an update frame naming an
+// uncreated identity is caught first by the revision-successor check, because a
+// missing predecessor reads as revision 0 and any legal frame's revision is at
+// least 1 more than that... except for exactly one shape. A frame at revision 1
+// with acceptance order 0 and an empty ranking scope matches the zero-valued
+// predecessor on every subsequent test, so without this check it would be folded
+// in as a silent CREATE performed by an update. The codec rejects that frame, so
+// it cannot arrive off the disk — but the check is what makes that a defence
+// rather than a coincidence of the codec's ceilings, and it is applied here
+// directly for the same reason.
+func TestOrderedViewRefusesAnUpdateToAnAbsentIdentity(t *testing.T) {
+	t.Parallel()
+	for _, op := range []orderedOp{orderedOpUpdate, orderedOpDelete} {
+		t.Run(strconv.Itoa(int(op)), func(t *testing.T) {
+			t.Parallel()
+			view := newOrderedView("sessions")
+			ghost := orderedMutation{
+				Op:            op,
+				OrderingScope: "host",
+				StableKey:     "ghost",
+				RankingScope:  "",
+				Revision:      1,
+				Order:         0,
+			}
+			if err := view.apply(ghost); !errors.Is(err, errOrderedInconsistentLog) {
+				t.Fatalf("apply of a %v for an absent identity = %v, want errOrderedInconsistentLog", op, err)
+			}
+			if len(view.records) != 0 {
+				t.Fatalf("the rejected frame still published %+v", view.records)
+			}
+		})
+	}
+}
+
+// TestOrderedViewReportsAnIndexThatLostAnEntry covers the one inconsistency no
+// log can produce: the view's record map and its sorted indexes disagreeing with
+// each other. insertCurrent puts a ranked or due record into the corresponding
+// index under exactly the conditions removeCurrent takes it out under, so a
+// missing entry means the two halves of the view have drifted — and continuing
+// would publish the updated record while the stale entry stayed in the sorted
+// slice, so a later page would return a record under sort keys it no longer has.
+//
+// It is a white-box test because the state it describes is unreachable from
+// outside; the alternative to testing it here is not testing it at all.
+func TestOrderedViewReportsAnIndexThatLostAnEntry(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		rank    storage.Rank
+		due     storage.Due
+		corrupt func(v *orderedView)
+	}{
+		{
+			name:    "the ranked index lost the entry",
+			rank:    storage.Rank{Ranked: true, Value: 5},
+			due:     storage.Due{},
+			corrupt: func(v *orderedView) { v.ranked["catalog"] = nil },
+		},
+		{
+			name:    "the due index lost the entry",
+			rank:    storage.Rank{},
+			due:     storage.Due{State: storage.DueAt, UnixMillis: 100},
+			corrupt: func(v *orderedView) { v.due = nil },
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			view := newOrderedView("sessions")
+			create := createMutation("host", "victim", 1)
+			create.Rank, create.Due = tt.rank, tt.due
+			if err := view.apply(create); err != nil {
+				t.Fatalf("apply create: %v", err)
+			}
+			tt.corrupt(view)
+
+			update := updateMutation("host", "victim", 2, 1)
+			update.Rank, update.Due = tt.rank, tt.due
+			if err := view.apply(update); !errors.Is(err, errOrderedInconsistentLog) {
+				t.Fatalf("apply over a lost index entry = %v, want errOrderedInconsistentLog", err)
+			}
+		})
+	}
+}
+
 // TestOrderedIndexValidatesArgumentsBeforeTheStore makes the up-front validation
 // gates OBSERVABLE, which they otherwise are not.
 //
@@ -2770,6 +2856,34 @@ func TestOrderedIndexInconsistentLogFailsClosed(t *testing.T) {
 			frames: []orderedMutation{
 				createMutation("host", "skipped", 1),
 				updateMutation("host", "skipped", 3, 1),
+			},
+		},
+		{
+			name: "create stamped with a revision other than 1",
+			frames: []orderedMutation{
+				func() orderedMutation {
+					m := createMutation("host", "reborn", 1)
+					m.Revision = 2
+					return m
+				}(),
+			},
+		},
+		{
+			name: "update that changes the ranking scope",
+			frames: []orderedMutation{
+				createMutation("host", "moved", 1),
+				func() orderedMutation {
+					m := updateMutation("host", "moved", 2, 1)
+					m.RankingScope = "elsewhere"
+					return m
+				}(),
+			},
+		},
+		{
+			name: "update that changes the acceptance order",
+			frames: []orderedMutation{
+				createMutation("host", "renumbered", 1),
+				updateMutation("host", "renumbered", 2, 9),
 			},
 		},
 		{

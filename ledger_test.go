@@ -680,6 +680,11 @@ func TestLedgerZeroFilledTailRecovery(t *testing.T) {
 				}
 			})
 
+			// Delete does NOT read the ledger — it takes the advisory lock and
+			// unlinks — so this subtest exercises no recovery at all. It is kept
+			// as the pin that deletion stays available on a ledger no other
+			// entry point can read, which is the operator's only escape hatch;
+			// it must not be read as evidence that Delete classifies a zero tail.
 			t.Run("Delete", func(t *testing.T) {
 				t.Parallel()
 				root, path := seed(t)

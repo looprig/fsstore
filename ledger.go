@@ -386,6 +386,12 @@ func (s *ledgerStore) Read(ctx context.Context, name string, from uint64) (stora
 // Tip returns the current tip for name (0 if the file is absent). It scans the
 // file read-only, so a torn tail is reported as the last good sequence without
 // mutating the file; a corrupt file fails closed.
+//
+// Like Read, it DISCARDS scanFrames' goodEnd rather than repairing the file, so
+// a torn tail is re-walked on every call and is truncated away only by the next
+// Append. That is a deliberate cost of keeping the read paths read-only — they
+// take no exclusive lock and work on a read-only mount — and it is bounded: the
+// re-walk is the same linear scan the call already performs.
 func (s *ledgerStore) Tip(ctx context.Context, name string) (uint64, error) {
 	if err := storage.ValidateName(name); err != nil {
 		return 0, err
