@@ -674,3 +674,66 @@ func TestOrderedCodecErrorClassification(t *testing.T) {
 		t.Errorf("unknown-fault message is shared with %q", prior)
 	}
 }
+
+// TestOrderedCodecSlicesAreCallerOwned pins a FROZEN CONTRACT clause: "returned
+// slices are caller-owned". The encoder must not retain the caller's Value, and
+// the decoder must not alias the payload buffer it was handed. Aliasing would be
+// invisible in normal use and catastrophic in the log's actual use, where one
+// mmap-sized read buffer backs every frame in the file: scribbling or reusing
+// that buffer would silently rewrite already-decoded mutations.
+func TestOrderedCodecSlicesAreCallerOwned(t *testing.T) {
+	t.Parallel()
+
+	t.Run("encode does not retain the caller's value", func(t *testing.T) {
+		t.Parallel()
+		m := goldenOrderedMutation()
+		m.Value = []byte("hello")
+		payload, err := encodeOrderedMutation(m)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		frozen := append([]byte{}, payload...)
+		for i := range m.Value {
+			m.Value[i] = 0xFF // the caller reuses its buffer
+		}
+		if !bytes.Equal(payload, frozen) {
+			t.Errorf("mutating the caller's Value changed the encoded payload:\n got %s\nwant %s",
+				hex.EncodeToString(payload), hex.EncodeToString(frozen))
+		}
+	})
+
+	t.Run("decode does not alias the payload buffer", func(t *testing.T) {
+		t.Parallel()
+		payload := mustHex(t, goldenOrderedPayloadHex)
+		got, err := decodeOrderedMutation(payload)
+		if err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		want := goldenOrderedMutation()
+		for i := range payload {
+			payload[i] = 0xFF // the caller reuses or truncates its buffer
+		}
+		if !mutationsEqual(got, want) {
+			t.Errorf("scribbling the payload changed the decoded mutation:\n got %+v\nwant %+v", got, want)
+		}
+	})
+
+	t.Run("frame decode does not alias the frame buffer", func(t *testing.T) {
+		t.Parallel()
+		frame := mustHex(t, goldenOrderedFrameHex)
+		seq, got, n, err := decodeOrderedFrame(frame)
+		if err != nil {
+			t.Fatalf("decode frame: %v", err)
+		}
+		if seq != goldenOrderedFrameSeq || n != len(frame) {
+			t.Fatalf("seq/bytesConsumed = %d/%d, want %d/%d", seq, n, goldenOrderedFrameSeq, len(frame))
+		}
+		want := goldenOrderedMutation()
+		for i := range frame {
+			frame[i] = 0xFF
+		}
+		if !mutationsEqual(got, want) {
+			t.Errorf("scribbling the frame changed the decoded mutation:\n got %+v\nwant %+v", got, want)
+		}
+	})
+}

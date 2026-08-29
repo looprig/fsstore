@@ -195,10 +195,14 @@ func TestOrderedLogRejectsInvalidNamespace(t *testing.T) {
 			if log != nil {
 				t.Errorf("log = %+v, want nil on error", log)
 			}
+			// Specifically the NAME error: logFor validates before it maps a
+			// path, so no namespace in this table may reach the containment
+			// guard. Accepting either type would let a validation regression
+			// pass silently. (The guard itself is tested directly by
+			// TestOrderedPathForRejectsEscape.)
 			var ine *storage.InvalidNameError
-			var pe *OrderedLogPathError
-			if !errors.As(err, &ine) && !errors.As(err, &pe) {
-				t.Fatalf("want *storage.InvalidNameError or *OrderedLogPathError, got %T: %v", err, err)
+			if !errors.As(err, &ine) {
+				t.Fatalf("want *storage.InvalidNameError, got %T: %v", err, err)
 			}
 		})
 	}
@@ -1170,5 +1174,81 @@ func TestOrderedLogCorruptErrorPrecedence(t *testing.T) {
 	}
 	if !errors.As(rerr, &ce) {
 		t.Fatalf("disk-damage error = %v, want the codec fault to remain unwrappable", rerr)
+	}
+}
+
+// TestOrderedPathForRejectsEscape tests the containment guard DIRECTLY. It is
+// unreachable through logFor, which runs ValidateName first, so it is defense in
+// depth against a future path that forgets to validate — and defense in depth
+// that is never exercised is just untested code. Every case here would otherwise
+// resolve to the ordered root itself or somewhere above it.
+func TestOrderedPathForRejectsEscape(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		namespace string
+	}{
+		{name: "empty maps to the ordered root itself", namespace: ""},
+		{name: "dot maps to the ordered root itself", namespace: "."},
+		{name: "parent", namespace: ".."},
+		{name: "parent escape", namespace: "../escape"},
+		{name: "deep parent escape", namespace: "../../../../etc/passwd"},
+		{name: "embedded escape", namespace: "a/../../escape"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			store, _ := newTestOrderedLogStore(t)
+			path, err := store.pathFor(tt.namespace)
+			if err == nil {
+				t.Fatalf("pathFor(%q) = %q, want a containment error", tt.namespace, path)
+			}
+			if path != "" {
+				t.Errorf("pathFor returned %q alongside an error, want an empty path", path)
+			}
+			var pe *OrderedLogPathError
+			if !errors.As(err, &pe) {
+				t.Fatalf("want *OrderedLogPathError, got %T: %v", err, err)
+			}
+			if pe.Namespace != tt.namespace {
+				t.Errorf("error namespace = %q, want %q", pe.Namespace, tt.namespace)
+			}
+		})
+	}
+}
+
+// TestOrderedPathForAcceptsValidNamespaces is the other half: a namespace the
+// grammar accepts must map inside the ordered root, with its segments becoming
+// directories and the .olog suffix appended.
+func TestOrderedPathForAcceptsValidNamespaces(t *testing.T) {
+	t.Parallel()
+	store, root := newTestOrderedLogStore(t)
+	// A leading slash is NOT an escape here: filepath.Join treats every operand
+	// after the first as relative, so "/etc/passwd" maps to <root>/ordered/etc/
+	// passwd.olog. It is rejected by ValidateName in logFor, one layer up, which
+	// is why that layer is the security boundary and this one is defense in depth.
+	for _, ns := range []string{"sessions", "factory/hosts", "a.b-c", "a/b/c/d", "/etc/passwd"} {
+		got, err := store.pathFor(ns)
+		if err != nil {
+			t.Fatalf("pathFor(%q): %v", ns, err)
+		}
+		want := filepath.Join(root, orderedDirName, filepath.FromSlash(ns)) + orderedLogExt
+		if got != want {
+			t.Errorf("pathFor(%q) = %q, want %q", ns, got, want)
+		}
+	}
+}
+
+// TestOrderedNameCeilingMatchesStorage guards against silent drift.
+// maxOrderedNameBytes duplicates storage's UNEXPORTED name ceiling, and the wire
+// format sizes a uint16 field against it. If storage ever moves its limit, this
+// test breaks — rather than a write that encodes a name the decoder rejects.
+func TestOrderedNameCeilingMatchesStorage(t *testing.T) {
+	t.Parallel()
+	if err := storage.ValidateName(strings.Repeat("a", maxOrderedNameBytes)); err != nil {
+		t.Errorf("storage.ValidateName rejects a name of exactly maxOrderedNameBytes (%d): %v", maxOrderedNameBytes, err)
+	}
+	if err := storage.ValidateName(strings.Repeat("a", maxOrderedNameBytes+1)); err == nil {
+		t.Errorf("storage.ValidateName accepts a name of maxOrderedNameBytes+1 (%d), so the ceiling has drifted", maxOrderedNameBytes+1)
 	}
 }
