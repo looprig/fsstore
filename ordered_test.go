@@ -1570,6 +1570,129 @@ func TestOrderedLogHonorsCancellationBeforeWork(t *testing.T) {
 	}
 }
 
+type orderedErrObservedContext struct {
+	context.Context
+	errObserved chan struct{}
+	once        sync.Once
+}
+
+func (c *orderedErrObservedContext) Err() error {
+	c.once.Do(func() { close(c.errObserved) })
+	return c.Context.Err()
+}
+
+// TestOrderedLogCancelsWhileWaitingForNamespaceLock proves cancellation can
+// stop an operation that has not begun file work while another goroutine owns
+// the namespace. The held lock is not released until the waiter returns, so an
+// uncancellable mutex deterministically deadlocks this assertion.
+func TestOrderedLogCancelsWhileWaitingForNamespaceLock(t *testing.T) {
+	t.Parallel()
+	store, root := newTestOrderedLogStore(t)
+	log, err := store.logFor("sessions")
+	if err != nil {
+		t.Fatalf("logFor: %v", err)
+	}
+	mustAppend(t, log, createMutation("host", "alpha", 1))
+	before := readFile(t, filepath.Join(root, orderedDirName, "sessions"+orderedLogExt))
+
+	if err := log.mu.lock(context.Background()); err != nil {
+		t.Fatalf("hold namespace lock: %v", err)
+	}
+	deadline, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	ctx := &orderedErrObservedContext{Context: deadline, errObserved: make(chan struct{})}
+	result := make(chan error, 1)
+	go func() {
+		_, aerr := commitMutation(ctx, log, createMutation("host", "beta", 2))
+		result <- aerr
+	}()
+	select {
+	case <-ctx.errObserved:
+	case <-time.After(time.Second):
+		log.mu.unlock()
+		t.Fatal("operation did not inspect context before waiting for namespace lock")
+	}
+	select {
+	case aerr := <-result:
+		log.mu.unlock()
+		if !errors.Is(aerr, context.DeadlineExceeded) {
+			t.Fatalf("blocked append error = %T %v, want context.DeadlineExceeded", aerr, aerr)
+		}
+	case <-time.After(time.Second):
+		log.mu.unlock()
+		<-result
+		t.Fatal("operation remained blocked after its context deadline")
+	}
+	if after := readFile(t, filepath.Join(root, orderedDirName, "sessions"+orderedLogExt)); !bytes.Equal(after, before) {
+		t.Fatalf("cancelled namespace-lock waiter modified log: %d bytes -> %d bytes", len(before), len(after))
+	}
+	if _, aerr := commitMutation(context.Background(), log, createMutation("host", "beta", 2)); aerr != nil {
+		t.Fatalf("append after namespace lock release: %v", aerr)
+	}
+}
+
+// TestOrderedLogCancelsWhileWaitingForAdvisoryLock holds LOCK_EX through a
+// distinct open file description and requires a waiting operation to return on
+// context cancellation without modifying the log. The holder remains locked
+// until the result arrives, so falling back to blocking flock cannot pass.
+func TestOrderedLogCancelsWhileWaitingForAdvisoryLock(t *testing.T) {
+	t.Parallel()
+	store, root := newTestOrderedLogStore(t)
+	log, err := store.logFor("sessions")
+	if err != nil {
+		t.Fatalf("logFor: %v", err)
+	}
+	mustAppend(t, log, createMutation("host", "alpha", 1))
+	logPath := filepath.Join(root, orderedDirName, "sessions"+orderedLogExt)
+	before := readFile(t, logPath)
+
+	holder, err := os.OpenFile(logPath, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatalf("open holder: %v", err)
+	}
+	defer holder.Close()
+	if err := lockFileEx(holder); err != nil {
+		t.Fatalf("lock holder: %v", err)
+	}
+	locked := true
+	defer func() {
+		if locked {
+			_ = unlockFile(holder)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, aerr := commitMutation(ctx, log, createMutation("host", "beta", 2))
+		result <- aerr
+	}()
+	select {
+	case aerr := <-result:
+		if !errors.Is(aerr, context.DeadlineExceeded) {
+			t.Fatalf("blocked append error = %T %v, want context.DeadlineExceeded", aerr, aerr)
+		}
+	case <-time.After(time.Second):
+		if err := unlockFile(holder); err != nil {
+			t.Fatalf("unlock holder after timeout: %v", err)
+		}
+		locked = false
+		<-result
+		t.Fatal("operation remained blocked on flock after its context deadline")
+	}
+	if after := readFile(t, logPath); !bytes.Equal(after, before) {
+		t.Fatalf("cancelled advisory-lock waiter modified log: %d bytes -> %d bytes", len(before), len(after))
+	}
+	if err := unlockFile(holder); err != nil {
+		t.Fatalf("unlock holder: %v", err)
+	}
+	locked = false
+	if _, aerr := commitMutation(context.Background(), log, createMutation("host", "beta", 2)); aerr != nil {
+		t.Fatalf("append after advisory lock release: %v", aerr)
+	}
+}
+
 // TestOrderedFirstAppendFsyncsTheDirectoryChain asserts that the ancestor
 // directory fsync happens on the FIRST append to a namespace and not on later
 // ones. It cannot prove durability — that needs crash injection, the same

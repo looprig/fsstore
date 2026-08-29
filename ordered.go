@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/looprig/storage"
 )
@@ -320,7 +321,7 @@ func (s *orderedLogStore) logFor(namespace string) (*orderedLog, error) {
 	}
 	log := s.logs[namespace]
 	if log == nil {
-		log = &orderedLog{namespace: namespace, path: path, stopDir: s.dir}
+		log = &orderedLog{namespace: namespace, path: path, stopDir: s.dir, mu: newOrderedContextMutex()}
 		s.logs[namespace] = log
 	}
 	return log, nil
@@ -338,7 +339,7 @@ type orderedLog struct {
 	path      string
 	stopDir   string // <root>/ordered: the top of the dir-fsync chain
 
-	mu sync.Mutex
+	mu orderedContextMutex
 
 	// The current-view cache, and the ONLY cached position: there is exactly one
 	// path that reads or writes this file (withView), so there is exactly one
@@ -362,6 +363,38 @@ type orderedLog struct {
 	appliedFrames uint64
 	catchUps      uint64
 }
+
+// orderedContextMutex is a single-permit mutex whose wait path can end with the
+// caller's context. Cancellation is honored only while waiting to START file
+// work; once withView owns both locks, it completes recovery or mutation rather
+// than abandoning a possibly durability-critical operation midway.
+type orderedContextMutex struct {
+	permit chan struct{}
+}
+
+func newOrderedContextMutex() orderedContextMutex {
+	permit := make(chan struct{}, 1)
+	permit <- struct{}{}
+	return orderedContextMutex{permit: permit}
+}
+
+func (m *orderedContextMutex) lock(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-m.permit:
+	}
+	if err := ctx.Err(); err != nil {
+		m.unlock()
+		return err
+	}
+	return nil
+}
+
+func (m *orderedContextMutex) unlock() { m.permit <- struct{}{} }
 
 // allZero reports whether every byte of b is zero. It is only ever called once
 // per scan, on the fault path, so the walk stays linear in the file size.
@@ -966,10 +999,33 @@ type orderedLogStats struct {
 	AppliedFrames uint64
 }
 
+// stats reports aggregate catch-up work across every namespace this store has
+// touched. The registry lock is held only long enough to take a stable snapshot
+// of the log pointers; each log then supplies its own counters under its own
+// mutex. This preserves the registry->log lock separation used by logFor while
+// giving provider conformance one store-wide measurement seam.
+func (s *orderedLogStore) stats() orderedLogStats {
+	s.mu.Lock()
+	logs := make([]*orderedLog, 0, len(s.logs))
+	for _, log := range s.logs {
+		logs = append(logs, log)
+	}
+	s.mu.Unlock()
+
+	var total orderedLogStats
+	for _, log := range logs {
+		stats := log.stats()
+		total.CatchUps += stats.CatchUps
+		total.ScannedBytes += stats.ScannedBytes
+		total.AppliedFrames += stats.AppliedFrames
+	}
+	return total
+}
+
 // stats returns the log's cumulative catch-up counters.
 func (l *orderedLog) stats() orderedLogStats {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	_ = l.mu.lock(context.Background())
+	defer l.mu.unlock()
 	return orderedLogStats{CatchUps: l.catchUps, ScannedBytes: l.scannedBytes, AppliedFrames: l.appliedFrames}
 }
 
@@ -1007,9 +1063,11 @@ type orderedDecision struct {
 // reintroduces a second recovery behaviour to keep straight. It is deliberately
 // left for a change that can carry those tests rather than folded in here.
 //
-// ctx is checked ONCE, before any lock is taken, and not again — the in-process
-// mutex and the blocking LOCK_EX are not cancellable, and abandoning the file
-// work midway is exactly what a path that may truncate a torn tail must not do.
+// ctx may cancel either lock wait before file work begins. The advisory wait
+// polls for the same exclusive LOCK_EX using LOCK_NB, rather than abandoning a
+// goroutine blocked in flock that could later acquire a lock nobody releases.
+// Once both locks are held, ctx is deliberately ignored: abandoning work midway
+// is unsafe for a path that may truncate recovery bytes or durably append.
 //
 // The seq return is meaningful ON ERROR, and callers must read it: a NONZERO seq
 // with a non-nil error means the frame WAS committed, fsynced, and folded into
@@ -1018,11 +1076,10 @@ type orderedDecision struct {
 // the view already holds it, so a Create retry takes the duplicate path — but a
 // caller must not report it to ITS caller as "nothing happened".
 func (l *orderedLog) withView(ctx context.Context, mutating bool, fn func(v *orderedView) (orderedDecision, error)) (seq uint64, err error) {
-	if cerr := ctx.Err(); cerr != nil {
-		return 0, cerr
+	if lerr := l.mu.lock(ctx); lerr != nil {
+		return 0, lerr
 	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	defer l.mu.unlock()
 
 	dir := filepath.Dir(l.path)
 	flags := os.O_RDWR
@@ -1037,6 +1094,9 @@ func (l *orderedLog) withView(ctx context.Context, mutating bool, fn func(v *ord
 
 	f, oerr := os.OpenFile(l.path, flags, 0o600) // #nosec G304 -- l.path is validated and contained under <root>/ordered
 	if errors.Is(oerr, fs.ErrNotExist) {
+		if cerr := ctx.Err(); cerr != nil {
+			return 0, cerr
+		}
 		// A read of a namespace that has never been written. It has no state, and
 		// creating a file to say so would litter the store with empty logs.
 		l.resetView()
@@ -1056,7 +1116,7 @@ func (l *orderedLog) withView(ctx context.Context, mutating bool, fn func(v *ord
 			err = &OrderedLogIOError{Op: "close", Path: l.path, Cause: cerr}
 		}
 	}()
-	if lerr := lockFileEx(f); lerr != nil {
+	if lerr := lockFileExContext(ctx, f); lerr != nil {
 		return 0, lerr
 	}
 	defer func() {
@@ -1111,6 +1171,50 @@ func (l *orderedLog) withView(ctx context.Context, mutating bool, fn func(v *ord
 	return l.appliedSeq, nil
 }
 
+const (
+	orderedLockRetryInitial = 100 * time.Microsecond
+	orderedLockRetryMax     = 10 * time.Millisecond
+)
+
+// lockFileExContext waits for an exclusive advisory lock without entering an
+// uncancellable flock syscall. A successful acquisition remains LOCK_EX; only
+// the waiting strategy changes. The bounded exponential delay reduces syscall
+// pressure under contention while checking cancellation frequently.
+func lockFileExContext(ctx context.Context, f *os.File) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	delay := orderedLockRetryInitial
+	for {
+		acquired, err := tryLockFileEx(f)
+		if err != nil {
+			return err
+		}
+		if acquired {
+			if err := ctx.Err(); err != nil {
+				return errors.Join(err, unlockFile(f))
+			}
+			return nil
+		}
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+		if delay < orderedLockRetryMax {
+			delay *= 2
+			if delay > orderedLockRetryMax {
+				delay = orderedLockRetryMax
+			}
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // storage.OrderedIndex
 // ---------------------------------------------------------------------------
@@ -1122,6 +1226,8 @@ func (l *orderedLog) withView(ctx context.Context, mutating bool, fn func(v *ord
 type orderedIndex struct {
 	store *orderedLogStore
 }
+
+func (x *orderedIndex) stats() orderedLogStats { return x.store.stats() }
 
 // Compile-time proof that *orderedIndex honors the OrderedIndex contract.
 var _ storage.OrderedIndex = (*orderedIndex)(nil)

@@ -11,18 +11,18 @@ import (
 	"github.com/looprig/storage"
 )
 
-// This file is fsstore's composition root: it wires the four filesystem backends
-// (ledger, leaser, KV, blobs) under one store root into a single storage
+// This file is fsstore's composition root: it wires the five filesystem backends
+// (ledger, leaser, KV, blobs, ordered index) under one store root into a single storage
 // field-bundle and exposes lifecycle (Open/Close).
 //
-// # Why a field-bundle, not an all-four interface
+// # Why a field-bundle, not an all-five interface
 //
-// storage's four primitives collide on method names — each of Ledger, KV, and
+// storage's primitives collide on method names — each of Ledger, KV, and
 // Blobs has its own Delete, for instance — so NO single Go type can implement all
-// four at once. storage solves this with Composite, a struct that EMBEDS one
+// five at once. storage solves this with Composite, a struct that EMBEDS one
 // provider per primitive; a caller reaches each as a field (c.Ledger, c.KV, …).
 // Store follows the same shape: it embeds *storage.Composite rather than
-// pretending to satisfy Ledger+Leaser+KV+Blobs itself. A consumer that wants the
+// pretending to satisfy Ledger+Leaser+KV+Blobs+OrderedIndex itself. A consumer that wants the
 // whole bundle (sessionstore.Open, say) is handed store.Composite (or Backend()).
 
 // errRootNotDir is the leaf cause recorded in an *OptionsError when Root already
@@ -30,7 +30,7 @@ import (
 var errRootNotDir = errors.New("fsstore: store root exists but is not a directory")
 
 // Options configures Open. Root is the single directory under which the store
-// lays out its four backends (streams/, leases/, kv/, blobs/); it is required.
+// lays out its five backends (streams/, leases/, kv/, blobs/, ordered/); it is required.
 type Options struct {
 	// Root is the store root directory. It is created at 0700 if absent. Required:
 	// an empty Root is rejected with an *OptionsError.
@@ -61,18 +61,19 @@ func (e *OptionsError) Unwrap() error { return e.Cause }
 
 // Store is an open fsstore rooted at a single directory on the local filesystem.
 // It embeds *storage.Composite, so a caller reaches each primitive as a promoted
-// field — store.Ledger, store.Leaser, store.KV, store.Blobs — and hands the whole
-// bundle to a consumer as store.Composite or via Backend. The four primitives
-// collide on method names, so no single type can implement all four (see the
+// field — store.Ledger, store.Leaser, store.KV, store.Blobs, store.OrderedIndex — and hands the whole
+// bundle to a consumer as store.Composite or via Backend. The five primitives
+// collide on method names, so no single type can implement all five (see the
 // file-level comment); embedding the field-bundle is how Store sidesteps that.
 type Store struct {
 	*storage.Composite
 	root string
 
 	// ledger is retained as its concrete type solely so Close can release the
-	// backend's in-process state (its cached name->file registry). The other three
-	// backends hold no releasable long-lived state.
-	ledger *ledgerStore
+	// backend's in-process state (its cached name->file registry). ordered retains
+	// the OrderedIndex namespace views for the same lifecycle purpose.
+	ledger  *ledgerStore
+	ordered *orderedIndex
 
 	mu     sync.Mutex
 	closed bool
@@ -80,9 +81,10 @@ type Store struct {
 
 // Open assembles a filesystem-backed storage bundle under opts.Root. It requires
 // a non-empty Root (empty -> *OptionsError), creates it at 0700, and verifies it
-// resolves to a directory. It then wires the four backends under that root —
-// <root>/streams, <root>/leases, <root>/kv, <root>/blobs, each created at 0700 by
-// its constructor — and bundles them with storage.NewComposite.
+// resolves to a directory. It then wires the five backends under that root —
+// <root>/streams, <root>/leases, <root>/kv, <root>/blobs, <root>/ordered, each
+// created at 0700 by its constructor — and bundles them with
+// storage.NewCompositeWithOrderedIndex.
 //
 // On any backend-construction failure Open returns that backend's typed error and
 // no Store; because every fs backend only creates directories (none holds an open
@@ -132,15 +134,19 @@ func Open(opts Options) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	composite, err := storage.NewComposite(ledger, leaser, kv, blobs)
+	ordered, err := newOrderedIndex(root)
 	if err != nil {
 		return nil, err
 	}
-	return &Store{Composite: composite, root: root, ledger: ledger}, nil
+
+	composite, err := storage.NewCompositeWithOrderedIndex(ledger, leaser, kv, blobs, ordered)
+	if err != nil {
+		return nil, err
+	}
+	return &Store{Composite: composite, root: root, ledger: ledger, ordered: ordered}, nil
 }
 
-// Backend returns the assembled four-primitive bundle to hand to a consumer such
+// Backend returns the assembled five-primitive bundle to hand to a consumer such
 // as sessionstore.Open. It is the embedded *storage.Composite; callers may read
 // store.Composite directly instead.
 func (s *Store) Backend() *storage.Composite { return s.Composite }
@@ -157,11 +163,13 @@ func (s *kvStore) StoragePaths() []string { return providerPaths(s.root) }
 
 func (s *blobStore) StoragePaths() []string { return providerPaths(s.root) }
 
+func (s *orderedIndex) StoragePaths() []string { return providerPaths(s.store.root) }
+
 func providerPaths(root string) []string { return []string{root} }
 
 // Close releases the store's in-process state. Concretely it drops the ledger
-// backend's cached name->file registry (the tip/size metadata retained after the
-// last write). The fs backends hold no long-lived file descriptors of their own —
+// backend's cached name->file registry and the ordered index's namespace views.
+// The fs backends hold no long-lived file descriptors of their own —
 // the ledger opens and closes its fd within each Append/Delete (the per-append
 // advisory-lock model), the KV and Blobs writers do the same, and a Leaser grant's
 // fd is owned and released by the caller via Lease.Release — so there are no open
@@ -176,5 +184,5 @@ func (s *Store) Close() error {
 		return nil
 	}
 	s.closed = true
-	return s.ledger.Close()
+	return errors.Join(s.ledger.Close(), s.ordered.Close())
 }

@@ -87,7 +87,7 @@ func TestOpenRootValidation(t *testing.T) {
 	}
 }
 
-// TestOpenLaysOutBackends verifies Open creates the four backend subdirectories
+// TestOpenLaysOutBackends verifies Open creates the five backend subdirectories
 // under Root, each at 0700, and that Backend()/the embedded Composite expose a
 // fully-wired bundle.
 func TestOpenLaysOutBackends(t *testing.T) {
@@ -103,7 +103,7 @@ func TestOpenLaysOutBackends(t *testing.T) {
 		}
 	})
 
-	for _, sub := range []string{"streams", "leases", "kv", "blobs"} {
+	for _, sub := range []string{"streams", "leases", "kv", "blobs", "ordered"} {
 		info, serr := os.Stat(filepath.Join(root, sub))
 		if serr != nil {
 			t.Fatalf("stat %s: %v", sub, serr)
@@ -124,9 +124,9 @@ func TestOpenLaysOutBackends(t *testing.T) {
 	if b != s.Composite {
 		t.Error("Backend() != embedded Composite")
 	}
-	if b.Ledger == nil || b.Leaser == nil || b.KV == nil || b.Blobs == nil {
-		t.Errorf("composite has a nil primitive: ledger=%v leaser=%v kv=%v blobs=%v",
-			b.Ledger == nil, b.Leaser == nil, b.KV == nil, b.Blobs == nil)
+	if b.Ledger == nil || b.Leaser == nil || b.KV == nil || b.Blobs == nil || b.OrderedIndex == nil {
+		t.Errorf("composite has a nil primitive: ledger=%v leaser=%v kv=%v blobs=%v ordered=%v",
+			b.Ledger == nil, b.Leaser == nil, b.KV == nil, b.Blobs == nil, b.OrderedIndex == nil)
 	}
 }
 
@@ -165,6 +165,7 @@ func TestStoragePaths(t *testing.T) {
 		{name: "leaser", reporter: s.Leaser.(storage.PathReporter)},
 		{name: "kv", reporter: s.KV.(storage.PathReporter)},
 		{name: "blobs", reporter: s.Blobs.(storage.PathReporter)},
+		{name: "ordered", reporter: s.OrderedIndex.(storage.PathReporter)},
 	}
 
 	for _, tt := range tests {
@@ -183,9 +184,9 @@ func TestStoragePaths(t *testing.T) {
 	}
 }
 
-// TestStoreRoundTrip exercises all four primitives through the assembled Store: a
-// ledger append+read, a lease acquire+release, a KV put+get, and a blob put+get,
-// each reached as a promoted field on the embedded Composite.
+// TestStoreRoundTrip exercises all five primitives through the assembled Store: a
+// ledger append+read, a lease acquire+release, a KV put+get, a blob put+get, and
+// an ordered create+get, each reached as a promoted field on the embedded Composite.
 func TestStoreRoundTrip(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -274,16 +275,32 @@ func TestStoreRoundTrip(t *testing.T) {
 	if !bytes.Equal(gotBlob, blobData) {
 		t.Errorf("Blobs.Get = %q, want %q", gotBlob, blobData)
 	}
+
+	// OrderedIndex: create an ordered record, then read it back.
+	orderedID := storage.OrderedID{Namespace: "sessions", OrderingScope: "commands", StableKey: "command-1"}
+	created, won, err := s.OrderedIndex.Create(ctx, orderedID, "catalog", []byte("ordered-value"), storage.Rank{Ranked: true, Value: 42}, storage.Due{State: storage.NotDue})
+	if err != nil {
+		t.Fatalf("OrderedIndex.Create: %v", err)
+	}
+	if !won {
+		t.Fatal("OrderedIndex.Create created = false, want true")
+	}
+	gotOrdered, err := s.OrderedIndex.Get(ctx, orderedID)
+	if err != nil {
+		t.Fatalf("OrderedIndex.Get: %v", err)
+	}
+	if gotOrdered.ID != orderedID || gotOrdered.Revision != 1 || gotOrdered.Order == 0 || !bytes.Equal(gotOrdered.Value, created.Value) {
+		t.Errorf("OrderedIndex.Get = %+v, want created record %+v", gotOrdered, created)
+	}
 }
 
 // TestStoreCloseReleasesAndIsIdempotent verifies Close drops the ledger backend's
-// in-process registry (its only releasable state) and that a second Close is a
-// no-op returning nil.
+// in-process registry and the ordered backend's namespace views, and that a
+// second Close is a no-op returning nil.
 //
-// Contract note: after Close the Store must not be reused. Close is not a hard
-// gate (the fs backends re-derive their on-disk state on demand), so this is a
-// caller discipline — the callee re-initialises the registry to stay panic-safe
-// rather than failing later operations closed.
+// Contract note: after Close the Store must not be reused. OrderedIndex enforces
+// this with *OrderedLogClosedError; the other filesystem primitives retain their
+// historical caller-discipline behavior.
 func TestStoreCloseReleasesAndIsIdempotent(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -299,12 +316,25 @@ func TestStoreCloseReleasesAndIsIdempotent(t *testing.T) {
 	if len(s.ledger.files) == 0 {
 		t.Fatal("ledger registry empty after Append, want a cached entry")
 	}
+	orderedID := storage.OrderedID{Namespace: "sessions", OrderingScope: "close", StableKey: "entry"}
+	if _, _, err := s.OrderedIndex.Create(ctx, orderedID, "catalog", []byte("x"), storage.Rank{}, storage.Due{State: storage.NotDue}); err != nil {
+		t.Fatalf("OrderedIndex.Create: %v", err)
+	}
+	if len(s.ordered.store.logs) == 0 {
+		t.Fatal("ordered registry empty after Create, want a cached entry")
+	}
 
 	if cerr := s.Close(); cerr != nil {
 		t.Fatalf("first Close: %v", cerr)
 	}
 	if n := len(s.ledger.files); n != 0 {
 		t.Errorf("ledger registry has %d entries after Close, want 0", n)
+	}
+	if n := len(s.ordered.store.logs); n != 0 {
+		t.Errorf("ordered registry has %d entries after Close, want 0", n)
+	}
+	if !s.ordered.store.closed {
+		t.Error("ordered store is open after Store.Close, want closed")
 	}
 	if !s.closed {
 		t.Error("Store.closed = false after Close, want true")
@@ -344,13 +374,20 @@ func TestOpenComposesConcreteBackends(t *testing.T) {
 	if _, ok := s.Blobs.(*blobStore); !ok {
 		t.Errorf("Blobs is %T, want *blobStore", s.Blobs)
 	}
+	wiredOrdered, ok := s.OrderedIndex.(*orderedIndex)
+	if !ok {
+		t.Errorf("OrderedIndex is %T, want *orderedIndex", s.OrderedIndex)
+	}
 	// The Store's retained ledger is the same instance wired into the Composite.
 	if s.ledger != s.Ledger.(*ledgerStore) {
 		t.Error("retained ledger differs from the composed Ledger")
 	}
+	if ok && s.ordered != wiredOrdered {
+		t.Error("retained ordered index differs from the composed OrderedIndex")
+	}
 }
 
-// Compile-time proof that the four fsstore backends honor their storage contracts.
+// Compile-time proof that the five fsstore backends honor their storage contracts.
 // (Per-backend assertions also live beside each implementation; these gather them
 // at the composition root so a break surfaces here too.)
 var (
@@ -358,9 +395,11 @@ var (
 	_ storage.Leaser       = (*leaserStore)(nil)
 	_ storage.KV           = (*kvStore)(nil)
 	_ storage.Blobs        = (*blobStore)(nil)
+	_ storage.OrderedIndex = (*orderedIndex)(nil)
 	_ storage.PathReporter = (*Store)(nil)
 	_ storage.PathReporter = (*ledgerStore)(nil)
 	_ storage.PathReporter = (*leaserStore)(nil)
 	_ storage.PathReporter = (*kvStore)(nil)
 	_ storage.PathReporter = (*blobStore)(nil)
+	_ storage.PathReporter = (*orderedIndex)(nil)
 )
