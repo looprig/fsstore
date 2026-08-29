@@ -737,3 +737,67 @@ func TestOrderedCodecSlicesAreCallerOwned(t *testing.T) {
 		}
 	})
 }
+
+// TestOrderedRankCanonicality pins the encoding's canonicality claim on the one
+// field that could otherwise alias: an UNRANKED record's Value is meaningless
+// (storage says a record with Ranked false is absent from ListRanked), so
+// Rank{Ranked:false, Value:7} and Rank{} must be the same wire value. Two byte
+// sequences meaning "unranked" would break "each field has exactly one
+// representation" — and the stray value would surface later in a ranked
+// comparator that reads Value without consulting Ranked.
+func TestOrderedRankCanonicality(t *testing.T) {
+	t.Parallel()
+
+	t.Run("encode normalizes an unranked value to zero", func(t *testing.T) {
+		t.Parallel()
+		zero := goldenOrderedMutation()
+		zero.Rank = storage.Rank{Ranked: false, Value: 0}
+		stray := goldenOrderedMutation()
+		stray.Rank = storage.Rank{Ranked: false, Value: 7}
+		a, err := encodeOrderedMutation(zero)
+		if err != nil {
+			t.Fatalf("encode canonical: %v", err)
+		}
+		b, err := encodeOrderedMutation(stray)
+		if err != nil {
+			t.Fatalf("encode stray: %v", err)
+		}
+		if !bytes.Equal(a, b) {
+			t.Errorf("unranked rank values encode differently:\n zero  %s\n stray %s",
+				hex.EncodeToString(a), hex.EncodeToString(b))
+		}
+		got, derr := decodeOrderedMutation(b)
+		if derr != nil {
+			t.Fatalf("decode: %v", derr)
+		}
+		if got.Rank != (storage.Rank{}) {
+			t.Errorf("decoded rank = %+v, want the zero Rank", got.Rank)
+		}
+	})
+
+	t.Run("decode rejects an unranked frame carrying a nonzero value", func(t *testing.T) {
+		t.Parallel()
+		payload := mustHex(t, goldenOrderedPayloadHex)
+		payload[offOrderedRankFlag] = orderedRankFlagUnranked
+		binary.LittleEndian.PutUint64(payload[offOrderedRankValue:], 7)
+		_, err := decodeOrderedMutation(payload)
+		var ce *OrderedCodecError
+		if !errors.As(err, &ce) {
+			t.Fatalf("want *OrderedCodecError, got %T: %v", err, err)
+		}
+		if ce.Fault != OrderedFaultInvalidRecord {
+			t.Errorf("fault = %d, want OrderedFaultInvalidRecord (%d)", ce.Fault, OrderedFaultInvalidRecord)
+		}
+	})
+
+	t.Run("an unranked tombstone with a stray value is still a legal tombstone", func(t *testing.T) {
+		t.Parallel()
+		m := goldenOrderedMutation()
+		m.Op = orderedOpDelete
+		m.Due = storage.Due{}
+		m.Rank = storage.Rank{Ranked: false, Value: 7}
+		if _, err := encodeOrderedMutation(m); err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+	})
+}

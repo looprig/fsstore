@@ -148,12 +148,17 @@ func FuzzOrderedFrameDecode(f *testing.F) {
 
 // FuzzOrderedMutationRoundTrip drives encode→decode from arbitrary field values
 // rather than arbitrary bytes, so it explores the accept side of the boundary:
-// any mutation the encoder accepts must decode back to the identical value.
+// any mutation the encoder accepts must decode back to the identical value —
+// after rank normalization, which is the encoder's one deliberate rewrite (an
+// unranked record's rank value is not part of its state and is canonicalized to
+// zero, so the round-trip identity is over the NORMALIZED mutation).
 func FuzzOrderedMutationRoundTrip(f *testing.F) {
 	f.Add(uint8(1), "s", "k", "r", uint64(1), uint64(1), uint8(0), int64(0), false, int64(0), []byte(nil))
 	f.Add(uint8(2), "a/b", "slash/value", "cat", uint64(2), uint64(300), uint8(1), int64(-1), true, int64(-9), []byte("v"))
 	f.Add(uint8(3), "sessions", "v1:ABC_def-09", "catalog", ^uint64(0), ^uint64(0), uint8(0), int64(0), false, int64(0), []byte("kept"))
 	f.Add(uint8(9), "", "", "", uint64(0), uint64(0), uint8(7), int64(1), true, int64(1), []byte{0xFF})
+	// An unranked record carrying a stray rank value: the normalization case.
+	f.Add(uint8(1), "s", "k", "r", uint64(1), uint64(1), uint8(0), int64(0), false, int64(7), []byte(nil))
 
 	f.Fuzz(func(t *testing.T, op uint8, scope, key, ranking string,
 		revision, order uint64, dueState uint8, millis int64, ranked bool, rankValue int64, value []byte) {
@@ -183,8 +188,8 @@ func FuzzOrderedMutationRoundTrip(f *testing.F) {
 		if decErr != nil {
 			t.Fatalf("decode of a freshly encoded mutation: %v", decErr)
 		}
-		if !mutationsEqual(got, m) {
-			t.Fatalf("round-trip mismatch:\n got %+v\nwant %+v", got, m)
+		if want := normalizeOrderedRank(m); !mutationsEqual(got, want) {
+			t.Fatalf("round-trip mismatch:\n got %+v\nwant %+v", got, want)
 		}
 	})
 }

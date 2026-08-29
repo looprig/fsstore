@@ -65,6 +65,14 @@ import (
 // header, there is no padding, and each field has exactly one representation.
 // decodeOrderedMutation therefore rejects trailing bytes, and any accepted
 // payload re-encodes byte-for-byte (a property the fuzz targets assert).
+//
+// Canonicality is not free for the two fields that pair a discriminator with a
+// payload. storage.ValidateDue already forces NotDue to carry a zero UnixMillis.
+// Rank has no such rule, so this codec supplies one: normalizeOrderedRank zeroes
+// an UNRANKED record's Value on the way in (storage says an unranked record is
+// absent from ListRanked, so the value means nothing), and the decoder REJECTS a
+// payload whose rank flag is 0 with a nonzero rank value rather than accepting a
+// second byte sequence for "unranked".
 
 const (
 	// orderedMutationVersion is the only payload version this build writes or
@@ -149,6 +157,20 @@ type orderedMutation struct {
 	Due           storage.Due
 	Rank          storage.Rank
 	Value         []byte
+}
+
+// normalizeOrderedRank returns m with its rank in canonical form: an unranked
+// record's Value is forced to zero. It runs BEFORE validation on encode, so an
+// unranked record with a stray value is accepted and stored canonically rather
+// than rejected — storage's own contract permits Rank{Ranked:false, Value:7} on
+// a live record, and a backend may not be stricter than the contract it
+// implements. It also means a tombstone's "must be the zero Rank" rule sees the
+// normalized value.
+func normalizeOrderedRank(m orderedMutation) orderedMutation {
+	if !m.Rank.Ranked {
+		m.Rank.Value = 0
+	}
+	return m
 }
 
 // deleted reports whether this mutation records a logical tombstone.
@@ -310,8 +332,10 @@ func validateOrderedMutation(m orderedMutation) error {
 // It validates first, so an illegal mutation never reaches the disk, and it
 // bounds the scope and key lengths against their uint16 fields — a check
 // ValidateName and ValidateStableKey already imply, restated here because the
-// wire widths, not the validators, are what would silently truncate.
+// wire widths, not the validators, are what would silently truncate. An unranked
+// rank is normalized first, so the encoding stays canonical.
 func encodeOrderedMutation(m orderedMutation) ([]byte, error) {
+	m = normalizeOrderedRank(m)
 	if err := validateOrderedMutation(m); err != nil {
 		return nil, err
 	}
@@ -373,6 +397,7 @@ func oversizeField(field string, length, max uint64) *OrderedCodecError {
 
 // decodeOrderedMutation parses one canonical version-1 payload. It rejects, in
 // this precedence: a payload shorter than the fixed header; an unknown version;
+// a non-canonical unranked rank (flag 0 with a nonzero value);
 // an unknown op; a declared field length beyond its ceiling (checked BEFORE any
 // buffer is sized to it, so a corrupt header cannot force a large allocation); a
 // payload shorter than its declared fields; trailing bytes beyond them; and
@@ -441,6 +466,14 @@ func decodeOrderedMutation(payload []byte) (orderedMutation, error) {
 			Fault: OrderedFaultInvalidRecord, Field: "rank_flag", Length: uint64(rankFlag),
 		}
 	}
+	wireRankValue := binary.LittleEndian.Uint64(payload[offOrderedRankValue:])
+	if rankFlag == orderedRankFlagUnranked && wireRankValue != 0 {
+		// A non-canonical alias for "unranked": the encoder never emits it, and
+		// accepting it would give one logical rank two byte representations.
+		return orderedMutation{}, &OrderedCodecError{
+			Fault: OrderedFaultInvalidRecord, Field: "rank_value", Length: wireRankValue,
+		}
+	}
 
 	off := orderedMutationHeaderSize
 	scope := string(payload[off : off+scopeLen])
@@ -470,7 +503,7 @@ func decodeOrderedMutation(payload []byte) (orderedMutation, error) {
 		Rank: storage.Rank{
 			Ranked: rankFlag == orderedRankFlagRanked,
 			// #nosec G115 -- a two's-complement reinterpretation, not a narrowing conversion
-			Value: int64(binary.LittleEndian.Uint64(payload[offOrderedRankValue:])),
+			Value: int64(wireRankValue),
 		},
 		Value: value,
 	}
