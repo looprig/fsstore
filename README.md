@@ -54,17 +54,18 @@ acquisition, it may leave that inert empty artifact, but never a committed or pa
 never a truncation. Once the exclusive advisory lock is held, recovery or mutation completes
 without abandoning durability-critical work midway.
 
-## Blob reader lifecycle
+## Blob reader close behavior
 
 The planned v0.5.1 release makes each successful `Blobs.Get` return a concrete,
-independent close-aware reader. `Read` and `Close` are safe concurrently; the first
-Close publishes closed state before closing its file, repeated Close calls return the
-same result, and every later Read returns zero bytes with `fs.ErrClosed` rather than
-ordinary EOF. Closing one reader never changes stored bytes or another reader.
+independent close-aware reader. `Read` and `Close` are race-safe; the first Close
+publishes closed state before closing its file, repeated Close calls return the
+same result, and every later Read returns zero bytes with `fs.ErrClosed` rather
+than ordinary EOF. Closing one reader never changes stored bytes or another
+reader.
 
-The Blobs provider advertises `BlobReaderCloseBound() time.Duration` with a
-conservative one-second bound so the optional lifecycle capability in the next
-published Storage release can discover it. fsstore v0.5.1 remains pinned to Storage
-v0.5.0 until that release exists. The bound covers fsstore-controlled synchronization;
-ordinary local-file syscalls have no provider queue or network wait but may still be
-delayed by the kernel or underlying filesystem outside fsstore's control.
+fsstore intentionally does not implement Storage's optional bounded Blob reader
+lifecycle capability. Portable ordinary-file I/O generally has no deadline
+support, so a slow kernel, network-filesystem, or FUSE Read cannot be
+force-cancelled within a finite bound. Close may therefore wait for an active
+Read to return; callers requiring strictly bounded reader shutdown must select a
+provider that advertises that capability.

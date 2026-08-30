@@ -12,14 +12,14 @@ import (
 	"time"
 )
 
-func TestBlobReaderLifecycleBoundAndConcreteReader(t *testing.T) {
+func TestBlobReaderGetReturnsConcreteReaderWithoutBoundClaim(t *testing.T) {
 	t.Parallel()
 	store, err := newBlobStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bound := store.BlobReaderCloseBound(); bound <= 0 || bound > time.Second {
-		t.Fatalf("BlobReaderCloseBound = %v, want positive and at most 1s", bound)
+	if _, ok := any(store).(interface{ BlobReaderCloseBound() time.Duration }); ok {
+		t.Fatal("fsstore must not claim a finite Blob reader close bound")
 	}
 	const key = "blobs/lifecycle-concrete"
 	if err := store.Put(context.Background(), key, bytes.NewReader([]byte("body"))); err != nil {
@@ -90,7 +90,7 @@ func TestBlobReaderCloseErrorIsStableAndStillPublishesClosed(t *testing.T) {
 	}
 }
 
-func TestBlobReaderReadAndCloseAreConcurrentSafe(t *testing.T) {
+func TestBlobReaderReadAndCloseAreRaceSafe(t *testing.T) {
 	t.Parallel()
 	store, err := newBlobStore(t.TempDir())
 	if err != nil {
@@ -130,22 +130,20 @@ func TestBlobReaderReadAndCloseAreConcurrentSafe(t *testing.T) {
 		<-started
 
 		closeDone := make(chan error, 1)
-		deadline := time.Now().Add(store.BlobReaderCloseBound())
 		go func() { closeDone <- reader.Close() }()
 		close(resume)
 
-		firstClose := receiveBlobLifecycleBefore(t, closeDone, deadline, "first Close")
+		firstClose := receiveBlobReaderTestResult(t, closeDone, "first Close")
 		if firstClose != nil {
 			t.Fatalf("attempt %d first Close = %v", attempt, firstClose)
 		}
-		readErr := receiveBlobLifecycleBefore(t, readDone, deadline, "active Read")
+		readErr := receiveBlobReaderTestResult(t, readDone, "active Read")
 		if !errors.Is(readErr, fs.ErrClosed) || readErr == io.EOF {
 			t.Fatalf("attempt %d concurrent Read ended with %v, want non-EOF fs.ErrClosed", attempt, readErr)
 		}
 		secondCloseDone := make(chan error, 1)
-		secondDeadline := time.Now().Add(store.BlobReaderCloseBound())
 		go func() { secondCloseDone <- reader.Close() }()
-		secondClose := receiveBlobLifecycleBefore(t, secondCloseDone, secondDeadline, "second Close")
+		secondClose := receiveBlobReaderTestResult(t, secondCloseDone, "second Close")
 		if (firstClose == nil) != (secondClose == nil) || (firstClose != nil && !errors.Is(firstClose, secondClose) && !errors.Is(secondClose, firstClose)) {
 			t.Fatalf("attempt %d Close results are not stable: first=%v second=%v", attempt, firstClose, secondClose)
 		}
@@ -155,19 +153,17 @@ func TestBlobReaderReadAndCloseAreConcurrentSafe(t *testing.T) {
 	}
 }
 
-func receiveBlobLifecycleBefore(t *testing.T, result <-chan error, deadline time.Time, operation string) error {
+// receiveBlobReaderTestResult is only a test-suite stall guard; it is not a
+// provider lifecycle promise and is deliberately unrelated to production API.
+func receiveBlobReaderTestResult(t *testing.T, result <-chan error, operation string) error {
 	t.Helper()
-	remaining := time.Until(deadline)
-	if remaining <= 0 {
-		t.Fatalf("%s did not finish within BlobReaderCloseBound", operation)
-	}
-	timer := time.NewTimer(remaining)
+	timer := time.NewTimer(5 * time.Second)
 	defer timer.Stop()
 	select {
 	case err := <-result:
 		return err
 	case <-timer.C:
-		t.Fatalf("%s did not finish within BlobReaderCloseBound", operation)
+		t.Fatalf("%s did not finish within the test stall guard", operation)
 		return nil
 	}
 }

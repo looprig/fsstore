@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/looprig/storage"
 )
@@ -91,28 +90,14 @@ type blobStore struct {
 	keys  map[string]*sync.Mutex
 }
 
-// blobReaderCloseBound is the conservative bound advertised for filesystem
-// reader lifecycle work controlled by fsstore. Ordinary local-file Read and
-// Close calls do not introduce provider queues or network waits.
-const blobReaderCloseBound = time.Second
-
-// BlobReaderCloseBound reports the conservative bound for fsstore-controlled
-// Blob reader shutdown work. Regular filesystem syscalls can still be delayed by
-// the kernel or underlying filesystem beyond fsstore's control.
-func (*blobStore) BlobReaderCloseBound() time.Duration { return blobReaderCloseBound }
-
 // Compile-time proof that *blobStore honors the Blobs contract.
 var _ storage.Blobs = (*blobStore)(nil)
 
-// blobReaderLifecycle mirrors the optional capability that the next published
-// storage release will expose. Keeping this interface local lets fsstore provide
-// and compile-check the method while go.mod remains pinned to storage v0.5.0.
-type blobReaderLifecycle interface {
-	storage.Blobs
-	BlobReaderCloseBound() time.Duration
-}
-
-var _ blobReaderLifecycle = (*blobStore)(nil)
+// fsstore intentionally does not implement storage.BlobReaderLifecycle.
+// Portable regular-file I/O generally has no deadline support, so a kernel,
+// network-filesystem, or FUSE Read cannot be force-cancelled within a finite
+// bound. blobFileReader still provides stable close publication and race safety,
+// but Close may wait for an active Read to return.
 
 // newBlobStore creates <root> and <root>/blobs at 0700 and returns a Blobs backend
 // rooted there. It rejects an empty root and wraps any mkdir failure in a typed
@@ -240,7 +225,9 @@ func (s *blobStore) Get(ctx context.Context, key string) (io.ReadCloser, error) 
 // blobFileReader serializes one file cursor with its closure. Close publishes
 // closed state before closing the fd, caches that first result, and is therefore
 // stable and idempotent. Every Read after closure returns fs.ErrClosed rather
-// than ordinary EOF, even if the underlying file Close itself failed.
+// than ordinary EOF, even if the underlying file Close itself failed. Because
+// Read holds mu across os.File.Read, Close waits for an active filesystem call;
+// no finite shutdown bound is claimed.
 type blobFileReader struct {
 	mu       sync.Mutex
 	file     *os.File
