@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -96,40 +97,69 @@ func TestBlobReaderReadAndCloseAreConcurrentSafe(t *testing.T) {
 		t.Fatal(err)
 	}
 	const key = "blobs/lifecycle-concurrent"
-	content := bytes.Repeat([]byte("x"), 8<<20)
+	content := bytes.Repeat([]byte("x"), 1<<20)
 	if err := store.Put(context.Background(), key, bytes.NewReader(content)); err != nil {
 		t.Fatal(err)
 	}
-	reader, err := store.Get(context.Background(), key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	started := make(chan struct{})
-	result := make(chan error, 1)
-	go func() {
-		var one [1]byte
-		close(started)
-		for {
-			_, err := reader.Read(one[:])
-			if err != nil {
-				result <- err
+	for attempt := range 20 {
+		reader, err := store.Get(context.Background(), key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		started := make(chan struct{})
+		resume := make(chan struct{})
+		readDone := make(chan error, 1)
+		go func() {
+			var one [1]byte
+			n, err := reader.Read(one[:])
+			if n != 1 || err != nil {
+				readDone <- fmt.Errorf("initial Read = %d, %v", n, err)
+				close(started)
 				return
 			}
+			close(started)
+			<-resume
+			for {
+				_, err := reader.Read(one[:])
+				if err != nil {
+					readDone <- err
+					return
+				}
+			}
+		}()
+		<-started
+
+		closeDone := make(chan error, 1)
+		deadline := time.Now().Add(store.BlobReaderCloseBound())
+		go func() { closeDone <- reader.Close() }()
+		close(resume)
+
+		if err := receiveBlobLifecycleBefore(t, closeDone, deadline, "Close"); err != nil {
+			t.Fatalf("attempt %d Close = %v", attempt, err)
 		}
-	}()
-	<-started
-	if err := reader.Close(); err != nil {
-		t.Fatal(err)
+		readErr := receiveBlobLifecycleBefore(t, readDone, deadline, "active Read")
+		if !errors.Is(readErr, fs.ErrClosed) || readErr == io.EOF {
+			t.Fatalf("attempt %d concurrent Read ended with %v, want non-EOF fs.ErrClosed", attempt, readErr)
+		}
+		if n, err := reader.Read(make([]byte, 1)); n != 0 || !errors.Is(err, fs.ErrClosed) || err == io.EOF {
+			t.Fatalf("attempt %d post-Close Read = %d, %v", attempt, n, err)
+		}
 	}
+}
+
+func receiveBlobLifecycleBefore(t *testing.T, result <-chan error, deadline time.Time, operation string) error {
+	t.Helper()
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		t.Fatalf("%s did not finish within BlobReaderCloseBound", operation)
+	}
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
 	select {
 	case err := <-result:
-		if !errors.Is(err, fs.ErrClosed) || err == io.EOF {
-			t.Fatalf("concurrent Read ended with %v, want non-EOF fs.ErrClosed", err)
-		}
-	case <-time.After(store.BlobReaderCloseBound()):
-		t.Fatal("Read remained active after Close bound")
-	}
-	if n, err := reader.Read(make([]byte, 1)); n != 0 || !errors.Is(err, fs.ErrClosed) || err == io.EOF {
-		t.Fatalf("post-Close Read = %d, %v", n, err)
+		return err
+	case <-timer.C:
+		t.Fatalf("%s did not finish within BlobReaderCloseBound", operation)
+		return nil
 	}
 }
