@@ -134,12 +134,20 @@ func TestBlobReaderReadAndCloseAreConcurrentSafe(t *testing.T) {
 		go func() { closeDone <- reader.Close() }()
 		close(resume)
 
-		if err := receiveBlobLifecycleBefore(t, closeDone, deadline, "Close"); err != nil {
-			t.Fatalf("attempt %d Close = %v", attempt, err)
+		firstClose := receiveBlobLifecycleBefore(t, closeDone, deadline, "first Close")
+		if firstClose != nil {
+			t.Fatalf("attempt %d first Close = %v", attempt, firstClose)
 		}
 		readErr := receiveBlobLifecycleBefore(t, readDone, deadline, "active Read")
 		if !errors.Is(readErr, fs.ErrClosed) || readErr == io.EOF {
 			t.Fatalf("attempt %d concurrent Read ended with %v, want non-EOF fs.ErrClosed", attempt, readErr)
+		}
+		secondCloseDone := make(chan error, 1)
+		secondDeadline := time.Now().Add(store.BlobReaderCloseBound())
+		go func() { secondCloseDone <- reader.Close() }()
+		secondClose := receiveBlobLifecycleBefore(t, secondCloseDone, secondDeadline, "second Close")
+		if (firstClose == nil) != (secondClose == nil) || (firstClose != nil && !errors.Is(firstClose, secondClose) && !errors.Is(secondClose, firstClose)) {
+			t.Fatalf("attempt %d Close results are not stable: first=%v second=%v", attempt, firstClose, secondClose)
 		}
 		if n, err := reader.Read(make([]byte, 1)); n != 0 || !errors.Is(err, fs.ErrClosed) || err == io.EOF {
 			t.Fatalf("attempt %d post-Close Read = %d, %v", attempt, n, err)
