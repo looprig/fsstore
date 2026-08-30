@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/looprig/storage"
 )
@@ -31,10 +32,10 @@ import (
 // makes that check-then-write atomic in-process, so two racing Puts of the same key
 // resolve to one write plus a no-op-or-conflict rather than a lost update.
 //
-// Get opens a fresh fd per call and returns the *os.File as an independent
-// io.ReadCloser, so concurrent readers never share state; it takes no lock (an
-// absent key is reported, a present one opened — the atomic-rename write path means
-// a reader never observes a partial object).
+// Get opens a fresh fd per call and wraps it as an independent close-aware
+// io.ReadCloser, so concurrent readers never share state; it takes no store lock
+// (an absent key is reported, a present one opened — the atomic-rename write path
+// means a reader never observes a partial object).
 //
 // ctx is accepted to satisfy the storage.Blobs contract but, like the memstore
 // reference backend, local filesystem syscalls are not interrupted mid-call.
@@ -90,8 +91,28 @@ type blobStore struct {
 	keys  map[string]*sync.Mutex
 }
 
+// blobReaderCloseBound is the conservative bound advertised for filesystem
+// reader lifecycle work controlled by fsstore. Ordinary local-file Read and
+// Close calls do not introduce provider queues or network waits.
+const blobReaderCloseBound = time.Second
+
+// BlobReaderCloseBound reports the conservative bound for fsstore-controlled
+// Blob reader shutdown work. Regular filesystem syscalls can still be delayed by
+// the kernel or underlying filesystem beyond fsstore's control.
+func (*blobStore) BlobReaderCloseBound() time.Duration { return blobReaderCloseBound }
+
 // Compile-time proof that *blobStore honors the Blobs contract.
 var _ storage.Blobs = (*blobStore)(nil)
+
+// blobReaderLifecycle mirrors the optional capability that the next published
+// storage release will expose. Keeping this interface local lets fsstore provide
+// and compile-check the method while go.mod remains pinned to storage v0.5.0.
+type blobReaderLifecycle interface {
+	storage.Blobs
+	BlobReaderCloseBound() time.Duration
+}
+
+var _ blobReaderLifecycle = (*blobStore)(nil)
 
 // newBlobStore creates <root> and <root>/blobs at 0700 and returns a Blobs backend
 // rooted there. It rejects an empty root and wraps any mkdir failure in a typed
@@ -192,11 +213,12 @@ func (s *blobStore) Put(ctx context.Context, key string, r io.Reader) error {
 	return nil
 }
 
-// Get opens key and returns its bytes as an independent io.ReadCloser. It validates
-// the key first (*InvalidNameError); an absent key yields a *BlobNotFoundError. Each
-// Get opens a FRESH fd, so concurrent readers never share a cursor and closing one
-// does not affect another. Get takes no lock: the atomic-rename write path means an
-// opened file is always a whole committed object.
+// Get opens key and returns its bytes as an independent, close-aware
+// io.ReadCloser. It validates the key first (*InvalidNameError); an absent key
+// yields a *BlobNotFoundError. Each Get opens a FRESH fd, so concurrent readers
+// never share a cursor and closing one does not affect another. Get takes no
+// store lock: the atomic-rename write path means an opened file is always a whole
+// committed object.
 func (s *blobStore) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	if err := storage.ValidateName(key); err != nil {
 		return nil, err
@@ -212,7 +234,40 @@ func (s *blobStore) Get(ctx context.Context, key string) (io.ReadCloser, error) 
 	if err != nil {
 		return nil, &BlobIOError{Op: "open", Path: path, Cause: err}
 	}
-	return f, nil
+	return &blobFileReader{file: f}, nil
+}
+
+// blobFileReader serializes one file cursor with its closure. Close publishes
+// closed state before closing the fd, caches that first result, and is therefore
+// stable and idempotent. Every Read after closure returns fs.ErrClosed rather
+// than ordinary EOF, even if the underlying file Close itself failed.
+type blobFileReader struct {
+	mu       sync.Mutex
+	file     *os.File
+	closed   bool
+	closeErr error
+}
+
+var _ io.ReadCloser = (*blobFileReader)(nil)
+
+func (r *blobFileReader) Read(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return 0, fs.ErrClosed
+	}
+	return r.file.Read(p)
+}
+
+func (r *blobFileReader) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return r.closeErr
+	}
+	r.closed = true
+	r.closeErr = r.file.Close()
+	return r.closeErr
 }
 
 // Delete removes key's file under the per-key mutex; it validates the key first
