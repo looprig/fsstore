@@ -71,7 +71,7 @@ CHECK_GO_DIRS = $(shell GOWORK=off go list -f '{{.Dir}}' ./...)
 CHECK_GO_FILES = $(foreach dir,$(CHECK_GO_DIRS),$(wildcard $(dir)/*.go))
 
 check-staticcheck:
-	GOWORK=off go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
+	GOWORK=off go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
 
 check-gosec:
 	GOWORK=off go run github.com/securego/gosec/v2/cmd/gosec@v2.28.0 -quiet $(CHECK_GO_DIRS)
