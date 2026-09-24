@@ -95,9 +95,9 @@ func closeOnError(f *os.File, path string, primary error, ioErr ioErrFunc) error
 //
 //   - no directory entry can be both a leaf file and a directory: a directory's
 //     name is a valid segment and never contains '@', a leaf file's always does.
-//     A name and any name extending it with "/..." ("a" -> "a@kv", "a/b" -> "a/"
-//   - "b@kv", "a.kv/b" -> "a.kv/" + "b@kv") therefore always coexist, whichever
-//     is created first;
+//     A name and any name extending it with "/..." therefore always coexist,
+//     whichever is created first: "a" -> "a@kv", "a/b" -> "a/b@kv", and
+//     "a.kv/b" -> "a.kv/b@kv";
 //   - the mapping is injective and reversible: stripping one trailing suffix from
 //     a leaf file recovers exactly the name's last segment, including a name that
 //     itself ends in a dotted extension ("a.kv" -> "a.kv@kv").
@@ -175,7 +175,9 @@ func walkKeys(root, prefix, suffix string) ([]string, error) {
 // suffix and its temp files start with '.', both outside the segment grammar.
 // So a non-directory entry whose name is a valid segment is exactly a legacy
 // leaf, and nothing else is (dotfiles, uppercase names and temp leftovers are
-// ignored). Empty legacy directories carry no data and are reused as-is. The
+// ignored). "Non-directory" deliberately includes symlinks and other special
+// files (WalkDir does not follow a symlink, even to a directory): fsstore never
+// creates one, so a valid-named one is refused as legacy rather than trusted. Empty legacy directories carry no data and are reused as-is. The
 // walk stops at the first hit; a clean tree costs one directory walk, the same
 // as one Keys/List call, and runs only at Open — never on an OrderedIndex page.
 func findLegacyLeaf(root string) (string, bool, error) {

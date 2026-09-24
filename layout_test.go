@@ -270,9 +270,10 @@ func TestOpenLegacyLayout(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	type plant struct {
-		rel  string // path under root, slash-separated
-		data string
-		dir  bool
+		rel     string // path under root, slash-separated
+		data    string
+		dir     bool
+		symlink string // when set, plant a symlink to this target instead of a file
 	}
 	cases := []struct {
 		label         string
@@ -282,6 +283,13 @@ func TestOpenLegacyLayout(t *testing.T) {
 		wantLeaf      string // rel path of the reported legacy leaf
 	}{
 		{label: "fresh root"},
+		// Any non-directory entry with a valid-segment name is refused, not only a
+		// regular file: a symlink (dangling, to a file, or to a directory — WalkDir
+		// does not follow it) is fail-closed as legacy rather than ignored.
+		{label: "symlink with a valid name in kv", plants: []plant{{rel: "kv/sessions/link", symlink: "/nonexistent"}}, wantPrimitive: "kv", wantLeaf: "kv/sessions/link"},
+		{label: "symlink to a directory in blobs", plants: []plant{{rel: "blobs/target", dir: true}, {rel: "blobs/link", symlink: "target"}}, wantPrimitive: "blobs", wantLeaf: "blobs/link"},
+		{label: "symlink to a file in leases", plants: []plant{{rel: "leases/x@lock", data: "1\n"}, {rel: "leases/alias", symlink: "x@lock"}}, wantPrimitive: "leaser", wantLeaf: "leases/alias"},
+		{label: "symlink with a suffixed name is not legacy", plants: []plant{{rel: "kv/a@kv", symlink: "/nonexistent"}}},
 		{label: "v0.5 kv leaf", plants: []plant{{rel: "kv/sessions/abc", data: "\x01\x00\x00\x00\x00\x00\x00\x00{}"}}, wantPrimitive: "kv", wantLeaf: "kv/sessions/abc"},
 		{label: "v0.5 kv top-level leaf", plants: []plant{{rel: "kv/solo", data: "x"}}, wantPrimitive: "kv", wantLeaf: "kv/solo"},
 		{label: "first legacy leaf is reported", plants: []plant{{rel: "kv/a/x", data: "x"}, {rel: "kv/b/y", data: "y"}}, wantPrimitive: "kv", wantLeaf: "kv/a/x"},
@@ -330,10 +338,17 @@ func TestOpenLegacyLayout(t *testing.T) {
 					}
 					continue
 				}
+				if p.symlink != "" {
+					if err := os.Symlink(p.symlink, full); err != nil {
+						t.Fatalf("symlink %q: %v", p.rel, err)
+					}
+					continue
+				}
 				if err := os.WriteFile(full, []byte(p.data), 0o600); err != nil {
 					t.Fatalf("plant %q: %v", p.rel, err)
 				}
 			}
+			before := snapshotTree(t, root)
 			s, err := Open(Options{Root: root})
 			if tc.wantPrimitive == "" {
 				if err != nil {
@@ -374,9 +389,25 @@ func TestOpenLegacyLayout(t *testing.T) {
 					t.Errorf("Error() = %q, want it to mention %q", lle.Error(), part)
 				}
 			}
-			// Refusal writes nothing: the legacy leaf is still there, untouched.
-			if _, err := os.Stat(lle.Path); err != nil {
-				t.Errorf("legacy leaf disturbed: %v", err)
+			// Refusal writes no data and removes nothing: every pre-existing entry
+			// is unchanged, and the only new entries are empty top-level
+			// primitive directories Open created before scanning.
+			after := snapshotTree(t, root)
+			for rel, was := range before {
+				if now, ok := after[rel]; !ok || now != was {
+					t.Errorf("refused Open changed %q: before %q, after %q (present=%v)", rel, was, now, ok)
+				}
+			}
+			for rel, now := range after {
+				if _, ok := before[rel]; ok {
+					continue
+				}
+				switch {
+				case now != "dir":
+					t.Errorf("refused Open created non-directory %q (%s)", rel, now)
+				case !isPrimitiveDir(rel):
+					t.Errorf("refused Open created directory %q outside the five primitive roots", rel)
+				}
 			}
 		})
 	}
@@ -670,4 +701,54 @@ func assertLeafFiles(t *testing.T, dir, suffix string, names []string) {
 			t.Fatalf("leaf file for %q at %q: info=%v err=%v, want a regular file", n, leaf, info, err)
 		}
 	}
+}
+
+// snapshotTree maps every entry under root (relative, slash-separated) to a
+// description of its type and content: "dir", "file:<bytes>" or
+// "symlink:<target>". Symlinks are not followed.
+func snapshotTree(t *testing.T, root string) map[string]string {
+	t.Helper()
+	out := make(map[string]string)
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, rerr := filepath.Rel(root, path)
+		if rerr != nil {
+			return rerr
+		}
+		if rel == "." {
+			return nil
+		}
+		rel = filepath.ToSlash(rel)
+		switch {
+		case d.IsDir():
+			out[rel] = "dir"
+		case d.Type()&os.ModeSymlink != 0:
+			target, lerr := os.Readlink(path)
+			if lerr != nil {
+				return lerr
+			}
+			out[rel] = "symlink:" + target
+		default:
+			data, rerr := os.ReadFile(path) // #nosec G304 -- test-local path under t.TempDir
+			if rerr != nil {
+				return rerr
+			}
+			out[rel] = "file:" + string(data)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("snapshot %q: %v", root, err)
+	}
+	return out
+}
+
+func isPrimitiveDir(rel string) bool {
+	switch rel {
+	case "kv", "blobs", "streams", "leases", "ordered":
+		return true
+	}
+	return false
 }

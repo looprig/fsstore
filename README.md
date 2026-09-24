@@ -47,7 +47,7 @@ holding the names that extend it: `sessions/a` (`kv/sessions/a@kv`) and `session
 (`kv/sessions/a/b@kv`) coexist in either creation order, as do `a` and `a.log/b`, and a name
 that itself ends in a dotted extension round-trips (`a.kv` → `kv/a.kv@kv`).
 
-### Breaking on-disk change in v0.6.0 (no migration)
+### v0.6.0: BREAKING on-disk layout, no migration, one-way
 
 fsstore v0.5.x and earlier stored KV and Blobs leaves with **no** suffix and ledger, lease and
 ordered-index files with **dotted** suffixes (`.log`, `.lock`, `.olog`). Neither kept a leaf
@@ -60,7 +60,15 @@ never silently invisible or half-read. A leftover v0.5.x lock file refuses too: 
 lease's persisted epoch counter, and ignoring it would restart the name's epochs. To proceed,
 **move or delete the old store root** and open a fresh one. A root written by v0.6.0 is
 misread by v0.5.x (it sees no data under the new names), so never roll a data directory back;
-a v0.5.x write into a v0.6.0 root makes the next v0.6.0 `Open` refuse it.
+a v0.5.x write into a v0.6.0 root makes the next v0.6.0 `Open` refuse it. A refused `Open`
+writes no data and removes nothing, though it may first create any of the five primitive
+directories that were missing (empty).
+
+The `@` suffix counts against the filesystem's per-name limit (255 bytes on common
+filesystems). A KV key whose final segment is 253 bytes or longer, or a Blobs key whose final
+segment is 251 bytes or longer, now fails with a typed IO error (`ENAMETOOLONG`); v0.5.2
+accepted those. Ledger, lease and ordered-index names are unaffected (their suffixes kept
+the same length). Hash- and UUID-shaped keys are far shorter.
 
 `Close` releases the ledger cache and OrderedIndex namespace views and is idempotent; after
 `Close` the `Store` must not be reused.

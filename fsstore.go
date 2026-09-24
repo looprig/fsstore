@@ -60,9 +60,10 @@ func (e *OptionsError) Error() string {
 func (e *OptionsError) Unwrap() error { return e.Cause }
 
 // ErrLegacyLayout is the sentinel every *LegacyLayoutError matches under
-// errors.Is. It means the store root holds KV or Blobs data written by fsstore
-// v0.5.x or earlier, whose on-disk layout v0.6.0 does not read.
-var ErrLegacyLayout = errors.New("fsstore: store root holds pre-v0.6.0 KV/Blobs data")
+// errors.Is. It means the store root holds data written by fsstore v0.5.x or
+// earlier — in any of its five primitive trees (KV, Blobs, ledger, leaser,
+// OrderedIndex) — whose on-disk layout v0.6.0 does not read.
+var ErrLegacyLayout = errors.New("fsstore: store root holds pre-v0.6.0 data")
 
 // LegacyLayoutError reports that Open refused a store root because one of its
 // primitive trees holds a leaf file in the pre-v0.6.0 layout. fsstore v0.6.0
@@ -71,7 +72,10 @@ var ErrLegacyLayout = errors.New("fsstore: store root holds pre-v0.6.0 KV/Blobs 
 // coexist, and ships NO migration: old-layout data would otherwise be silently
 // invisible (KV/Blobs report not-found, a ledger reads as empty, a lease's epoch
 // counter restarts) while new writes landed beside it. Open fails closed
-// instead, before any caller can read or write the root.
+// instead, before any caller can read or write the root. A refused Open writes
+// no data and removes nothing; it may already have created any of the five
+// primitive directories that were missing (empty), since the backends are
+// constructed before the scan.
 //
 // Remedy: move or delete the old root and open a fresh one; the data is not
 // convertible in place by fsstore. Root is the resolved store root, Primitive
