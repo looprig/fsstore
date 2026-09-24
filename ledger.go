@@ -15,7 +15,7 @@ import (
 )
 
 // This file implements storage.Ledger over the local filesystem: one append-only
-// file per named ledger, laid out as <root>/streams/<name>.log where the name's
+// file per named ledger, laid out as <root>/streams/<name>@log where the name's
 // '/'-separated segments become directory components. Each record is an
 // encodeFrame frame (see frame.go); the file is the concatenation of its frames.
 //
@@ -52,8 +52,11 @@ import (
 // ctx is accepted to satisfy the storage.Ledger contract but, like the memstore
 // reference backend, local filesystem syscalls are not interrupted mid-call.
 
-// logExt is the on-disk suffix appended to every ledger file's mapped path.
-const logExt = ".log"
+// logExt is the on-disk suffix appended to every ledger file's mapped path. It
+// starts with '@', outside the storage name grammar, so a ledger file never shares
+// a directory entry with a longer name's directory (see the leaf-suffix scheme in
+// fswrite.go; v0.5.x used ".log", which "a" and "a.log/b" collided on).
+const logExt = "@log"
 
 // errNonContiguousSeq is the leaf cause recorded in a LedgerCorruptError when a
 // frame's decoded sequence does not follow its predecessor (a gap or reordering
@@ -186,7 +189,7 @@ func ledgerIOErr(op, path string, cause error) error {
 
 // pathFor maps a storage name to its ledger file path under streams and verifies
 // the result stays within streams (containment / defense in depth). The name's
-// '/'-separated segments become path components; the file gains the .log suffix.
+// '/'-separated segments become path components; the file gains the @log suffix.
 // Containment is LEXICAL: it assumes an exclusively-owned root created at 0700 and
 // does NOT resolve symlinks, so a symlink planted inside streams by another writer
 // could still redirect a mapped path. Owning the store root is the deployment's
@@ -290,7 +293,7 @@ func (s *ledgerStore) Append(ctx context.Context, name string, expected uint64, 
 	}
 	if created {
 		// On first creation the new dirents may reach up several levels (e.g.
-		// streams/sessions/<uuid>.log creates streams/sessions), so fsync the
+		// streams/sessions/<uuid>@log creates streams/sessions), so fsync the
 		// ancestor chain from the file's directory up to and including streams.
 		if derr := fsyncDirChain(dir, s.streams, ledgerIOErr); derr != nil {
 			return derr
@@ -565,7 +568,7 @@ func fsyncDir(dir string, ioErr ioErrFunc) (err error) {
 
 // fsyncDirChain fsyncs every directory from leafDir up to and including stopDir,
 // so that on a first-ever ledger creation the new directory entries — which may
-// span several levels (e.g. a new streams/sessions holding the .log file) — are
+// span several levels (e.g. a new streams/sessions holding the @log file) — are
 // all durable across a crash. leafDir is always stopDir or a descendant of it (it
 // derives from a path contained under stopDir), so the walk terminates at stopDir;
 // the filesystem-root guard is defensive belt-and-braces only. ioErr threads the

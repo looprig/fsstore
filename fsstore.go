@@ -64,17 +64,18 @@ func (e *OptionsError) Unwrap() error { return e.Cause }
 // v0.5.x or earlier, whose on-disk layout v0.6.0 does not read.
 var ErrLegacyLayout = errors.New("fsstore: store root holds pre-v0.6.0 KV/Blobs data")
 
-// LegacyLayoutError reports that Open refused a store root because its kv/ or
-// blobs/ tree holds a leaf file in the pre-v0.6.0 layout. fsstore v0.6.0 changed
-// the KV and Blobs on-disk layout (every leaf file now carries an '@kv'/'@blob'
-// suffix so a key and a key extending it with "/..." can coexist) and ships NO
-// migration: old-layout data would otherwise be silently invisible (Get reports
-// not-found, Keys/List omit it) while new writes landed beside it. Open fails
-// closed instead, before any caller can read or write the root.
+// LegacyLayoutError reports that Open refused a store root because one of its
+// primitive trees holds a leaf file in the pre-v0.6.0 layout. fsstore v0.6.0
+// changed every primitive's leaf suffix to an '@' form ("@kv", "@blob", "@log",
+// "@lock", "@olog") so a name and a name extending it with "/..." can always
+// coexist, and ships NO migration: old-layout data would otherwise be silently
+// invisible (KV/Blobs report not-found, a ledger reads as empty, a lease's epoch
+// counter restarts) while new writes landed beside it. Open fails closed
+// instead, before any caller can read or write the root.
 //
-// Remedy: move or delete the old root (or at least its kv/ and blobs/ trees) and
-// open a fresh one; the data is not convertible in place by fsstore. Root is the
-// resolved store root, Primitive is "kv" or "blobs", and Path is the first legacy
+// Remedy: move or delete the old root and open a fresh one; the data is not
+// convertible in place by fsstore. Root is the resolved store root, Primitive
+// is "kv", "blobs", "ledger", "leaser" or "ordered", and Path is the first legacy
 // leaf file found. It matches ErrLegacyLayout under errors.Is.
 type LegacyLayoutError struct {
 	Root      string
@@ -118,9 +119,9 @@ type Store struct {
 // created at 0700 by its constructor — and bundles them with
 // storage.NewCompositeWithOrderedIndex.
 //
-// Before bundling, Open scans kv/ and blobs/ and refuses a root that holds
-// pre-v0.6.0 KV/Blobs data with *LegacyLayoutError (errors.Is ErrLegacyLayout);
-// v0.6.0 changed that layout and does not migrate it.
+// Before bundling, Open scans every primitive's tree and refuses a root that
+// holds pre-v0.6.0 data with *LegacyLayoutError (errors.Is ErrLegacyLayout);
+// v0.6.0 changed every primitive's leaf suffix and does not migrate.
 //
 // On any backend-construction failure Open returns that backend's typed error and
 // no Store; because every fs backend only creates directories (none holds an open
@@ -170,11 +171,11 @@ func Open(opts Options) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := refuseLegacyLayout(root, kv, blobs); err != nil {
-		return nil, err
-	}
 	ordered, err := newOrderedIndex(root)
 	if err != nil {
+		return nil, err
+	}
+	if err := refuseLegacyLayout(root, kv, blobs, ledger, leaser, ordered); err != nil {
 		return nil, err
 	}
 
@@ -185,26 +186,37 @@ func Open(opts Options) (*Store, error) {
 	return &Store{Composite: composite, root: root, ledger: ledger, ordered: ordered}, nil
 }
 
-// refuseLegacyLayout fails Open closed when the kv/ or blobs/ tree holds a
-// pre-v0.6.0 (unsuffixed) leaf file, returning *LegacyLayoutError; see
-// findLegacyLeaf for why that test is exact. A walk fault is returned as the
+// refuseLegacyLayout fails Open closed when any primitive's tree holds a
+// pre-v0.6.0 leaf file, returning *LegacyLayoutError naming that primitive; see
+// findLegacyLeaf for why that test is exact. Every primitive changed its leaf
+// suffix in v0.6.0 (KV/Blobs from none, ledger from ".log", leaser from ".lock",
+// OrderedIndex from ".olog"), so all five trees are scanned, in a fixed order
+// (kv, blobs, ledger, leaser, ordered). A walk fault is returned as that
 // primitive's typed IO error (Op "layout-scan") rather than treated as clean.
-// Only kv/ and blobs/ are scanned: the ledger, leaser and ordered backends
-// always suffixed their files and did not change layout.
-func refuseLegacyLayout(root string, kv *kvStore, blobs *blobStore) error {
-	path, found, err := findLegacyLeaf(kv.kv)
-	if err != nil {
-		return &KVIOError{Op: "layout-scan", Path: kv.kv, Cause: err}
-	}
-	if found {
-		return &LegacyLayoutError{Root: root, Primitive: "kv", Path: path}
-	}
-	path, found, err = findLegacyLeaf(blobs.blobs)
-	if err != nil {
-		return &BlobIOError{Op: "layout-scan", Path: blobs.blobs, Cause: err}
-	}
-	if found {
-		return &LegacyLayoutError{Root: root, Primitive: "blobs", Path: path}
+//
+// A leftover v0.5.x lock file refuses too, even though no process holds it: a
+// lock file IS its lease's persisted epoch counter, so ignoring it would restart
+// that name's epochs at 1 under a fresh "@lock" file and hand out epochs a
+// fenced predecessor already held.
+func refuseLegacyLayout(root string, kv *kvStore, blobs *blobStore, ledger *ledgerStore, leaser *leaserStore, ordered *orderedIndex) error {
+	for _, tree := range []struct {
+		primitive string
+		dir       string
+		ioErr     ioErrFunc
+	}{
+		{primitive: "kv", dir: kv.kv, ioErr: kvIOErr},
+		{primitive: "blobs", dir: blobs.blobs, ioErr: blobIOErr},
+		{primitive: "ledger", dir: ledger.streams, ioErr: ledgerIOErr},
+		{primitive: "leaser", dir: leaser.leases, ioErr: leaseIOErr},
+		{primitive: "ordered", dir: ordered.store.dir, ioErr: orderedIOErr},
+	} {
+		path, found, err := findLegacyLeaf(tree.dir)
+		if err != nil {
+			return tree.ioErr("layout-scan", tree.dir, err)
+		}
+		if found {
+			return &LegacyLayoutError{Root: root, Primitive: tree.primitive, Path: path}
+		}
 	}
 	return nil
 }

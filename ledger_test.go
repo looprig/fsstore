@@ -17,7 +17,7 @@ import (
 // ledgerFilePath returns the on-disk path the ledger backend maps name to, so a
 // test can corrupt or truncate the underlying file directly.
 func ledgerFilePath(root, name string) string {
-	return filepath.Join(root, "streams", filepath.FromSlash(name)+".log")
+	return filepath.Join(root, "streams", filepath.FromSlash(name)+"@log")
 }
 
 // readAllRecords drains a cursor to exhaustion on the calling goroutine.
@@ -432,7 +432,7 @@ func TestLedgerNamePathMapping(t *testing.T) {
 	cases := []struct {
 		label string
 		name  string
-		rel   []string // path segments under streams, last one gets ".log"
+		rel   []string // path segments under streams, last one gets "@log"
 	}{
 		{label: "single segment", name: "solo", rel: []string{"solo"}},
 		{label: "two segments", name: "a/b", rel: []string{"a", "b"}},
@@ -449,7 +449,7 @@ func TestLedgerNamePathMapping(t *testing.T) {
 			if err := s.Append(ctx, tc.name, 0, []byte("p")); err != nil {
 				t.Fatalf("Append: %v", err)
 			}
-			want := filepath.Join(append([]string{root, "streams"}, tc.rel...)...) + ".log"
+			want := filepath.Join(append([]string{root, "streams"}, tc.rel...)...) + "@log"
 			if _, err := os.Stat(want); err != nil {
 				t.Fatalf("expected ledger file at %q: %v", want, err)
 			}

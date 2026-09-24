@@ -261,8 +261,9 @@ func TestLeafWriteLeavesNoTempFiles(t *testing.T) {
 }
 
 // TestOpenLegacyLayout proves Open fails closed, with *LegacyLayoutError
-// (errors.Is ErrLegacyLayout), on any root holding a pre-v0.6.0 KV or Blobs leaf
-// — an unsuffixed file whose name is a valid storage segment — at any depth, and
+// (errors.Is ErrLegacyLayout), on any root holding a pre-v0.6.0 leaf in any
+// primitive's tree — a file whose name is a valid storage segment, e.g. an
+// unsuffixed KV/Blob leaf or a "*.log"/"*.lock"/"*.olog" file — at any depth, and
 // that roots holding only things v0.6.0 itself writes (or harmless leftovers)
 // open and keep their data.
 func TestOpenLegacyLayout(t *testing.T) {
@@ -297,7 +298,19 @@ func TestOpenLegacyLayout(t *testing.T) {
 		{label: "legacy empty directories", plants: []plant{{rel: "kv/sessions/abc", dir: true}, {rel: "blobs/sessions/abc/blobs", dir: true}}},
 		{label: "crash-leftover temp files", seed: seedCurrentLayout, plants: []plant{{rel: "kv/sessions/" + fsTmpPrefix + "4242", data: "partial"}, {rel: "blobs/" + fsTmpPrefix + "77", data: ""}}},
 		{label: "foreign dotfiles and invalid names", plants: []plant{{rel: "kv/.DS_Store", data: "x"}, {rel: "blobs/sessions/Thumbs.DB", data: "x"}, {rel: "kv/sessions/UPPER", data: "x"}}},
-		{label: "legacy-named files outside kv and blobs", plants: []plant{{rel: "streams/loose", data: "x"}, {rel: "leases/loose", data: "x"}, {rel: "ordered/loose", data: "x"}, {rel: "loose", data: "x"}}},
+		{label: "legacy-named file at the root, outside every tree", plants: []plant{{rel: "loose", data: "x"}, {rel: "notes.log", data: "x"}}},
+		{label: "v0.5 ledger log", plants: []plant{{rel: "streams/sessions/abc.log", data: "frame"}}, wantPrimitive: "ledger", wantLeaf: "streams/sessions/abc.log"},
+		{label: "v0.5 ledger log empty", plants: []plant{{rel: "streams/a.log", data: ""}}, wantPrimitive: "ledger", wantLeaf: "streams/a.log"},
+		{label: "v0.5 leftover lock file (epoch counter)", plants: []plant{{rel: "leases/sessions/abc.lock", data: "7\n"}}, wantPrimitive: "leaser", wantLeaf: "leases/sessions/abc.lock"},
+		{label: "v0.5 leftover empty lock file", plants: []plant{{rel: "leases/solo.lock", data: ""}}, wantPrimitive: "leaser", wantLeaf: "leases/solo.lock"},
+		{label: "v0.5 ordered log", plants: []plant{{rel: "ordered/sessionstore/gates/0.olog", data: "x"}}, wantPrimitive: "ordered", wantLeaf: "ordered/sessionstore/gates/0.olog"},
+		{label: "unsuffixed file in streams", plants: []plant{{rel: "streams/loose", data: "x"}}, wantPrimitive: "ledger", wantLeaf: "streams/loose"},
+		{label: "legacy ledger beside v0.6 data", seed: seedNonLeafPrimitives, plants: []plant{{rel: "streams/sessions/old.log", data: "x"}}, wantPrimitive: "ledger", wantLeaf: "streams/sessions/old.log"},
+		{label: "legacy lock beside v0.6 data", seed: seedNonLeafPrimitives, plants: []plant{{rel: "leases/sessions/a.lock", data: "3\n"}}, wantPrimitive: "leaser", wantLeaf: "leases/sessions/a.lock"},
+		{label: "scan order kv blobs ledger leaser ordered", plants: []plant{{rel: "ordered/n.olog", data: "x"}, {rel: "leases/l.lock", data: "x"}, {rel: "streams/s.log", data: "x"}}, wantPrimitive: "ledger", wantLeaf: "streams/s.log"},
+		{label: "leaser before ordered", plants: []plant{{rel: "ordered/n.olog", data: "x"}, {rel: "leases/l.lock", data: "x"}}, wantPrimitive: "leaser", wantLeaf: "leases/l.lock"},
+		{label: "blobs before ledger", plants: []plant{{rel: "streams/s.log", data: "x"}, {rel: "blobs/b", data: "x"}}, wantPrimitive: "blobs", wantLeaf: "blobs/b"},
+		{label: "crash-leftover dotfiles in every tree", plants: []plant{{rel: "streams/." + "x.log", data: "x"}, {rel: "leases/.DS_Store", data: "x"}, {rel: "ordered/.fsstore-tmp-1", data: "x"}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.label, func(t *testing.T) {
@@ -369,14 +382,14 @@ func TestOpenLegacyLayout(t *testing.T) {
 	}
 }
 
-// TestOpenLegacyLayoutScanError proves an unreadable kv/ subtree fails Open
+// TestOpenLegacyLayoutScanError proves an unreadable subtree of any primitive fails Open
 // closed with a typed IO error rather than being treated as clean.
 func TestOpenLegacyLayoutScanError(t *testing.T) {
 	t.Parallel()
 	if os.Geteuid() == 0 {
 		t.Skip("root ignores directory permissions")
 	}
-	for _, dir := range []string{"kv", "blobs"} {
+	for _, dir := range []string{"kv", "blobs", "streams", "leases", "ordered"} {
 		t.Run(dir, func(t *testing.T) {
 			t.Parallel()
 			root := t.TempDir()
@@ -406,6 +419,21 @@ func TestOpenLegacyLayoutScanError(t *testing.T) {
 				var ioe *BlobIOError
 				if !errors.As(err, &ioe) || ioe.Op != "layout-scan" {
 					t.Fatalf("Open = %T %v, want *BlobIOError{Op: layout-scan}", err, err)
+				}
+			case "streams":
+				var ioe *LedgerIOError
+				if !errors.As(err, &ioe) || ioe.Op != "layout-scan" {
+					t.Fatalf("Open = %T %v, want *LedgerIOError{Op: layout-scan}", err, err)
+				}
+			case "leases":
+				var ioe *LeaseIOError
+				if !errors.As(err, &ioe) || ioe.Op != "layout-scan" {
+					t.Fatalf("Open = %T %v, want *LeaseIOError{Op: layout-scan}", err, err)
+				}
+			case "ordered":
+				var ioe *OrderedLogIOError
+				if !errors.As(err, &ioe) || ioe.Op != "layout-scan" {
+					t.Fatalf("Open = %T %v, want *OrderedLogIOError{Op: layout-scan}", err, err)
 				}
 			}
 		})
@@ -491,4 +519,155 @@ func without(s []string, drop string) []string {
 		}
 	}
 	return out
+}
+
+// dottedExtensionNameSets are the name sets every primitive must store at once,
+// in the listed order and reversed: a name beside its '/' extension, and a name
+// beside a longer name whose first segment is that name plus each extension
+// fsstore has ever used as a leaf suffix (v0.5.x ".log"/".lock"/".olog") or
+// might (".kv"/".blob"). Under v0.5.x's dotted suffixes "a" owned file "a.log"
+// while "a.log/b" needed directory "a.log".
+func dottedExtensionNameSets() [][]string {
+	sets := [][]string{
+		{"a", "a/b"},
+		{"sessions/a", "sessions/a/b/c"},
+		{"a.log", "a", "a.log/b"},
+	}
+	for _, ext := range []string{".log", ".lock", ".olog", ".kv", ".blob", ".x"} {
+		sets = append(sets, []string{"a", "a" + ext + "/b"}, []string{"sessions/a", "sessions/a" + ext + "/b/c"})
+	}
+	n := len(sets)
+	for i := 0; i < n; i++ {
+		rev := make([]string, len(sets[i]))
+		for j, v := range sets[i] {
+			rev[len(rev)-1-j] = v
+		}
+		sets = append(sets, rev)
+	}
+	return sets
+}
+
+// TestLedgerNamesWithDottedExtensionsCoexist appends one frame to every name of
+// each set and reads each back: no name's log may shadow another's directory.
+func TestLedgerNamesWithDottedExtensionsCoexist(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	for _, names := range dottedExtensionNameSets() {
+		t.Run(strings.Join(names, "+"), func(t *testing.T) {
+			t.Parallel()
+			root := t.TempDir()
+			s, err := newLedgerStore(root)
+			if err != nil {
+				t.Fatalf("newLedgerStore: %v", err)
+			}
+			t.Cleanup(func() { _ = s.Close() })
+			for _, n := range names {
+				if err := s.Append(ctx, n, 0, []byte("p:"+n)); err != nil {
+					t.Fatalf("Append(%q): %v", n, err)
+				}
+			}
+			assertLeafFiles(t, filepath.Join(root, "streams"), "@log", names)
+			for _, n := range names {
+				cur, err := s.Read(ctx, n, 1)
+				if err != nil {
+					t.Fatalf("Read(%q): %v", n, err)
+				}
+				rec, err := cur.Next(ctx)
+				_ = cur.Close()
+				if err != nil || rec.Seq != 1 || string(rec.Payload) != "p:"+n {
+					t.Fatalf("Read(%q) = (%d %q, %v), want seq 1 %q", n, rec.Seq, rec.Payload, err, "p:"+n)
+				}
+			}
+			// Deleting the first name leaves the rest readable.
+			if err := s.Delete(ctx, names[0]); err != nil {
+				t.Fatalf("Delete(%q): %v", names[0], err)
+			}
+			for _, n := range names[1:] {
+				if tip, err := s.Tip(ctx, n); err != nil || tip != 1 {
+					t.Fatalf("Tip(%q) after delete = (%d, %v), want 1", n, tip, err)
+				}
+			}
+		})
+	}
+}
+
+// TestLeaserNamesWithDottedExtensionsCoexist holds a grant on every name of each
+// set at once; each is a first grant (epoch 1) with its own lock file.
+func TestLeaserNamesWithDottedExtensionsCoexist(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	for _, names := range dottedExtensionNameSets() {
+		t.Run(strings.Join(names, "+"), func(t *testing.T) {
+			t.Parallel()
+			root := t.TempDir()
+			s, err := newLeaserStore(root)
+			if err != nil {
+				t.Fatalf("newLeaserStore: %v", err)
+			}
+			for _, n := range names {
+				l, err := s.Acquire(ctx, n)
+				if err != nil {
+					t.Fatalf("Acquire(%q): %v", n, err)
+				}
+				t.Cleanup(func() { _ = l.Release(ctx) })
+				if l.Epoch() != 1 {
+					t.Fatalf("Acquire(%q) epoch = %d, want 1", n, l.Epoch())
+				}
+			}
+			assertLeafFiles(t, filepath.Join(root, "leases"), "@lock", names)
+		})
+	}
+}
+
+// TestOrderedNamespacesWithDottedExtensionsCoexist creates a record in every
+// namespace of each set and reads each back from a fresh index (so the logs,
+// not the warm views, are what is read).
+func TestOrderedNamespacesWithDottedExtensionsCoexist(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	for _, names := range dottedExtensionNameSets() {
+		t.Run(strings.Join(names, "+"), func(t *testing.T) {
+			t.Parallel()
+			root := t.TempDir()
+			x, err := newOrderedIndex(root)
+			if err != nil {
+				t.Fatalf("newOrderedIndex: %v", err)
+			}
+			for _, n := range names {
+				id := storage.OrderedID{Namespace: n, OrderingScope: "s", StableKey: "k"}
+				if _, _, err := x.Create(ctx, id, "r", []byte("v:"+n), storage.Rank{}, storage.Due{State: storage.NotDue}); err != nil {
+					t.Fatalf("Create(%q): %v", n, err)
+				}
+			}
+			assertLeafFiles(t, filepath.Join(root, "ordered"), "@olog", names)
+			if err := x.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+			y, err := newOrderedIndex(root)
+			if err != nil {
+				t.Fatalf("reopen: %v", err)
+			}
+			t.Cleanup(func() { _ = y.Close() })
+			for _, n := range names {
+				rec, err := y.Get(ctx, storage.OrderedID{Namespace: n, OrderingScope: "s", StableKey: "k"})
+				if err != nil || string(rec.Value) != "v:"+n {
+					t.Fatalf("Get(%q) = (%q, %v), want %q", n, rec.Value, err, "v:"+n)
+				}
+			}
+		})
+	}
+}
+
+// assertLeafFiles checks, after every name's operation succeeded, that each name
+// owns a regular file at <dir>/<name><suffix>. It runs last so a layout without
+// the '@' suffix fails on the semantic operation (a "not a directory"
+// collision), not merely on this literal path.
+func assertLeafFiles(t *testing.T, dir, suffix string, names []string) {
+	t.Helper()
+	for _, n := range names {
+		leaf := filepath.Join(dir, filepath.FromSlash(n)) + suffix
+		if info, err := os.Lstat(leaf); err != nil || !info.Mode().IsRegular() {
+			t.Fatalf("leaf file for %q at %q: info=%v err=%v, want a regular file", n, leaf, info, err)
+		}
+	}
 }

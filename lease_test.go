@@ -13,7 +13,7 @@ import (
 // leaseLockPath returns the on-disk path the leaser maps name to, so a test can
 // inspect the persisted epoch counter or assert the file's location directly.
 func leaseLockPath(root, name string) string {
-	return filepath.Join(root, "leases", filepath.FromSlash(name)+".lock")
+	return filepath.Join(root, "leases", filepath.FromSlash(name)+"@lock")
 }
 
 // TestLeaseLockFileLocation proves a granted lease materializes its lock file at

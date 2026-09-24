@@ -8,7 +8,8 @@ import (
 	"github.com/looprig/storage"
 )
 
-// FuzzLeafEncoding checks the KV/Blobs leaf encoding over arbitrary input:
+// FuzzLeafEncoding checks every primitive's leaf encoding (KV, Blobs, ledger,
+// leaser, OrderedIndex) over arbitrary input:
 //
 //   - every valid name maps (pathFor) to a path under the primitive's directory
 //     whose relative form leafKey decodes back to exactly that name;
@@ -22,11 +23,15 @@ func FuzzLeafEncoding(f *testing.F) {
 	for _, seed := range []string{
 		"a", "a/b", "sessions/a/object-metadata/v1/x", "a.kv", "a.blob", "a.kv/b",
 		"a@kv", "a@kv@kv", "@kv", "a/@kv", ".fsstore-tmp-1@kv", "Upper@kv", "",
+		"a.log/b", "a@log", "c.lock/d", "n.olog/m", "a@olog",
 	} {
 		f.Add(seed)
 	}
 	kv := &kvStore{kv: "/root/kv"}
 	blobs := &blobStore{blobs: "/root/blobs"}
+	ledger := &ledgerStore{streams: "/root/streams"}
+	leaser := &leaserStore{leases: "/root/leases"}
+	ordered := &orderedLogStore{dir: "/root/ordered"}
 	f.Fuzz(func(t *testing.T, s string) {
 		for _, enc := range []struct {
 			dir    string
@@ -35,6 +40,9 @@ func FuzzLeafEncoding(f *testing.F) {
 		}{
 			{dir: kv.kv, suffix: kvLeafSuffix, path: kv.pathFor},
 			{dir: blobs.blobs, suffix: blobLeafSuffix, path: blobs.pathFor},
+			{dir: ledger.streams, suffix: logExt, path: ledger.pathFor},
+			{dir: leaser.leases, suffix: leaseExt, path: leaser.pathFor},
+			{dir: ordered.dir, suffix: orderedLogExt, path: ordered.pathFor},
 		} {
 			if storage.ValidateName(s) == nil {
 				p, err := enc.path(s)

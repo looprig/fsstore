@@ -2615,7 +2615,7 @@ func TestOrderedIndexStableKeyNeverReachesAPath(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("walk store root: %v", err)
 	}
-	want := []string{"ordered", "ordered/sessions.olog"}
+	want := []string{"ordered", "ordered/sessions@olog"}
 	if !equalStrings(found, want) {
 		t.Fatalf("store contains %v, want exactly %v", found, want)
 	}

@@ -233,7 +233,7 @@ func TestOrderedIndexProductionHasNoUnapprovedDirectoryEnumeration(t *testing.T)
 					return true
 				}
 				// findLegacyLeaf is Open's one-shot pre-v0.6.0 layout scan of
-				// kv/ and blobs/; it never runs on an OrderedIndex path.
+				// each primitive's tree; it never runs on an OrderedIndex page.
 				if path == "fswrite.go" && function.Name.Name == "findLegacyLeaf" && qualifier == "path/filepath" && selector.Sel.Name == "WalkDir" {
 					allowedLegacyScanImplementations++
 					return true
@@ -256,8 +256,8 @@ func TestOrderedIndexProductionHasNoUnapprovedDirectoryEnumeration(t *testing.T)
 	if allowedLegacyScanImplementations != 1 {
 		t.Fatalf("approved fswrite.go/findLegacyLeaf filepath.WalkDir calls = %d, want 1", allowedLegacyScanImplementations)
 	}
-	if allowedLegacyScanCalls != 2 {
-		t.Fatalf("approved refuseLegacyLayout findLegacyLeaf calls = %d, want 2", allowedLegacyScanCalls)
+	if allowedLegacyScanCalls != 1 {
+		t.Fatalf("approved refuseLegacyLayout findLegacyLeaf calls = %d, want 1", allowedLegacyScanCalls)
 	}
 }
 

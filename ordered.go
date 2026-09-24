@@ -17,7 +17,7 @@ import (
 
 // This file implements the durable substrate of fsstore's OrderedIndex: one
 // append-only, checksummed mutation log per namespace, laid out at
-// <root>/ordered/<namespace>.olog where the namespace's '/'-separated segments
+// <root>/ordered/<namespace>@olog where the namespace's '/'-separated segments
 // become directory components. Each record is an ordered mutation frame (see
 // ordered_codec.go) and the file is the concatenation of its frames.
 //
@@ -123,9 +123,12 @@ const (
 	orderedDirName = "ordered"
 
 	// orderedLogExt is the on-disk suffix of a namespace's mutation log. It is
-	// deliberately distinct from the ledger's .log so the two file families are
-	// never confused by an operator or a recovery tool.
-	orderedLogExt = ".olog"
+	// deliberately distinct from the ledger's @log so the two file families are
+	// never confused by an operator or a recovery tool. It starts with '@',
+	// outside the storage name grammar, so a log never shares a directory entry
+	// with a longer namespace's directory (see the leaf-suffix scheme in
+	// fswrite.go; v0.5.x used ".olog", which "n" and "n.olog/m" collided on).
+	orderedLogExt = "@olog"
 )
 
 // errOrderedNonContiguousSeq is the leaf cause recorded in an
@@ -285,7 +288,7 @@ func (s *orderedLogStore) Close() error {
 
 // pathFor maps a namespace to its log file path under <root>/ordered and
 // verifies the result stays within that directory. The namespace's
-// '/'-separated segments become path components; the file gains the .olog
+// '/'-separated segments become path components; the file gains the @olog
 // suffix. Containment is LEXICAL: it assumes an exclusively-owned root created
 // at 0700 and does NOT resolve symlinks, so a symlink planted inside the ordered
 // directory by another writer could still redirect a mapped path. Owning the

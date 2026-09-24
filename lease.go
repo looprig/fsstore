@@ -14,7 +14,7 @@ import (
 )
 
 // This file implements storage.Leaser over the local filesystem: one lock file
-// per named lease, laid out as <root>/leases/<name>.lock where the name's
+// per named lease, laid out as <root>/leases/<name>@lock where the name's
 // '/'-separated segments become directory components.
 //
 // # Exclusion model
@@ -47,8 +47,11 @@ import (
 // ctx is accepted to satisfy the storage.Leaser/Lease contract but local
 // filesystem syscalls are not interrupted mid-call.
 
-// leaseExt is the on-disk suffix appended to every lock file's mapped path.
-const leaseExt = ".lock"
+// leaseExt is the on-disk suffix appended to every lock file's mapped path. It
+// starts with '@', outside the storage name grammar, so a lock file never shares
+// a directory entry with a longer name's directory (see the leaf-suffix scheme in
+// fswrite.go; v0.5.x used ".lock", which "c" and "c.lock/d" collided on).
+const leaseExt = "@lock"
 
 // maxEpochBytes bounds the advisory read of the epoch counter. A uint64 is at most
 // 20 decimal digits plus a trailing '\n'; 32 bytes leaves generous headroom while
@@ -99,6 +102,12 @@ func (e *LeaseIOError) Error() string {
 
 // Unwrap exposes the underlying filesystem error.
 func (e *LeaseIOError) Unwrap() error { return e.Cause }
+
+// leaseIOErr adapts *LeaseIOError to the ioErrFunc shape, so Open's layout scan
+// of the leases tree surfaces a lease-typed IO error.
+func leaseIOErr(op, path string, cause error) error {
+	return &LeaseIOError{Op: op, Path: path, Cause: cause}
+}
 
 // LeaseCorruptError reports that a lock file's persisted epoch counter could not be
 // trusted: it is present but not a valid decimal uint64. Acquire fails closed
@@ -153,7 +162,7 @@ func newLeaserStore(root string) (*leaserStore, error) {
 
 // pathFor maps a storage name to its lock file path under leases and verifies the
 // result stays within leases (containment / defense in depth). The name's
-// '/'-separated segments become path components; the file gains the .lock suffix.
+// '/'-separated segments become path components; the file gains the @lock suffix.
 // Containment is LEXICAL: it assumes an exclusively-owned root created at 0700 and
 // does NOT resolve symlinks. Owning the store root is the deployment's
 // responsibility (identical to the ledger backend's model).
