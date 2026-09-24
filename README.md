@@ -10,6 +10,26 @@ temp-file + rename writes); Blobs are content-addressed immutable byte objects; 
 uses one checksummed append-only mutation log plus warm in-memory order, rank, and due views per
 namespace. It depends only on the Go standard library and `github.com/looprig/storage`.
 
+## Status
+
+- Implements all five storage primitives and conforms to the `github.com/looprig/storage` v0.7.0
+  contract, including its nested-name cases (a name and a name extending it with `/…` coexist).
+  The storage conformance suite runs in `conformance_test.go`.
+- **v0.6.0 changed the on-disk layout with no migration, one-way**: `Open` refuses a pre-v0.6.0
+  root with `ErrLegacyLayout` (see below).
+- **Does not implement `storage.BlobReaderLifecycle`** (bounded Blob reader shutdown). Consumers
+  that require it, such as `sessionstore.Open`, reject an fsstore Blobs provider (see
+  "Blob reader close behavior").
+
+## Install
+
+```sh
+go get github.com/looprig/fsstore@latest
+```
+
+It sits in tier 1 of the Looprig graph (foundation adapters); its only Looprig dependency is
+`github.com/looprig/storage`.
+
 Ledger and KV assume **single-writer-per-name**: their reads take no advisory lock and trust that
 no one rewrites committed bytes concurrently. Enforcing that discipline is the **caller's
 responsibility** — acquire the name's lease via the `Leaser` before writing those entries.
@@ -23,18 +43,27 @@ store root, so owning that directory is the deployment's responsibility.
 `Open` wires the five backends under one root directory and returns them bundled as a complete
 `*storage.Composite` (the primitives collide on method names, so they are composed as a
 field-bundle, not a single all-five type — reach each as `store.Ledger`, `store.Leaser`,
-`store.KV`, `store.Blobs`, `store.OrderedIndex`). Hand the bundle to a consumer such as
-`sessionstore.Open`:
+`store.KV`, `store.Blobs`, `store.OrderedIndex`). Hand the bundle to a consumer as
+`store.Backend()` (or `store.Composite`):
 
 ```go
 store, err := fsstore.Open(fsstore.Options{Root: "/var/lib/looprig"})
+if errors.Is(err, fsstore.ErrLegacyLayout) {
+    return fmt.Errorf("pre-v0.6.0 store root; move or delete it: %w", err) // never retry
+}
 if err != nil {
     return err
 }
 defer store.Close() // releases in-process state; idempotent
 
-sess, err := sessionstore.Open(store.Backend()) // or store.Composite
+backend := store.Backend() // *storage.Composite
+if err := backend.Ledger.Append(ctx, "sessions/example", 0, []byte("created")); err != nil {
+    return err
+}
+rev, err := backend.KV.Put(ctx, "catalog/example", 0, []byte("ready"))
 ```
+
+`examples/durable` has a complete runnable example covering the ledger, KV and Blobs.
 
 `Root` is required (an empty `Root` is rejected with an `*OptionsError`) and is created at
 `0700` if absent. Its layout is `streams/`, `leases/`, `kv/`, `blobs/`, and `ordered/`.
@@ -88,8 +117,8 @@ without abandoning durability-critical work midway.
 
 ## Blob reader close behavior
 
-The planned v0.5.1 release makes each successful `Blobs.Get` return a concrete,
-independent close-aware reader. `Read` and `Close` are race-safe; the first Close
+Each successful `Blobs.Get` returns a concrete, independent close-aware reader
+(since v0.5.1). `Read` and `Close` are race-safe; the first Close
 publishes closed state before closing its file, repeated Close calls return the
 same result, and every later Read returns zero bytes with `fs.ErrClosed` rather
 than ordinary EOF. Closing one reader never changes stored bytes or another
@@ -101,3 +130,25 @@ support, so a slow kernel, network-filesystem, or FUSE Read cannot be
 force-cancelled within a finite bound. Close may therefore wait for an active
 Read to return; callers requiring strictly bounded reader shutdown must select a
 provider that advertises that capability.
+
+Because of this, a consumer that requires the capability refuses an fsstore Blobs
+provider: `sessionstore.Open` fails before any I/O with
+`InvalidBackendError{Component: "BlobReaderLifecycle"}`.
+
+## Development
+
+The baseline is Go 1.26.8. Verify the module standalone, never against a workspace:
+
+```sh
+GOWORK=off go test ./...
+make check   # fmt-check, vet, staticcheck, gosec, govulncheck, race tests, build
+```
+
+`make test` runs `GOWORK=off go test -race ./...`; `make secure` runs the lint and security
+tools from `PATH` and skips any that are not installed. The module has no integration tags or
+external infrastructure. See [CONTRIBUTING.md](CONTRIBUTING.md) for the dependency and design
+rules (the Go standard library and `github.com/looprig/storage` only).
+
+## License
+
+Apache License 2.0; see [LICENSE](LICENSE).
