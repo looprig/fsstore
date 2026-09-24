@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/looprig/storage"
 )
 
 // This file holds the durable-write and tree-listing mechanics shared by the
@@ -18,8 +20,10 @@ import (
 
 // fsTmpPrefix marks a temp file staged for an atomic rename. It starts with a '.',
 // which the storage name grammar forbids as a segment's first byte, so a temp
-// file can never collide with a committed key and is always skipped by walkKeys —
-// a concurrent listing therefore never surfaces a half-written value as a key.
+// file can never collide with a committed key, is never a leaf to walkKeys (its
+// stripped name is not a valid key) and is never mistaken for a legacy leaf by
+// findLegacyLeaf — a concurrent listing therefore never surfaces a half-written
+// value as a key, and a crash-leftover temp file never blocks Open.
 const fsTmpPrefix = ".fsstore-tmp-"
 
 // ioErrFunc constructs a backend's typed filesystem IO error from an operation
@@ -80,14 +84,56 @@ func closeOnError(f *os.File, path string, primary error, ioErr ioErrFunc) error
 	return primary
 }
 
+// Leaf suffixes. Every KV and Blobs key maps to <dir>/<segments...> where every
+// segment but the last is a directory and the last is a regular file named
+// "<last segment><suffix>". Each suffix starts with '@', a byte the storage name
+// grammar ([a-z0-9][a-z0-9_.-]* per segment) forbids, so:
+//
+//   - no directory entry can be both a leaf file and a directory: a directory's
+//     name is a valid segment and never contains '@', a leaf file's always does.
+//     A key and a key extending it with "/..." ("a" -> "a@kv", "a/b" -> "a/" +
+//     "b@kv") therefore always coexist, whichever is created first;
+//   - the mapping is injective and reversible: stripping one trailing suffix from
+//     a leaf file recovers exactly the key's last segment, including a key that
+//     itself ends in ".kv" ("a.kv" -> "a.kv@kv").
+//
+// A plain dotted suffix (".kv", like ledger.go's ".log") would NOT keep leaves
+// and directories apart: key "a" would own file "a.kv" while key "a.kv/b" needs
+// a directory "a.kv" at the same entry. An uppercase suffix (".KV") would fail
+// the same way on a case-insensitive filesystem (the macOS default), which
+// folds it onto the valid lowercase name, so the suffix uses punctuation the
+// grammar forbids instead.
+const (
+	kvLeafSuffix   = "@kv"
+	blobLeafSuffix = "@blob"
+)
+
+// leafKey reports the key a directory entry at rel (a slash-separated path
+// relative to a KV or Blobs root) encodes under suffix, and whether it is a
+// committed leaf at all. An entry is a leaf only when its name ends in suffix
+// and the stripped path is a valid storage name; temp files (fsTmpPrefix, which
+// starts with '.'), pre-v0.6.0 unsuffixed files, foreign dotfiles and any other
+// name that no valid key produces are rejected, so listing reports exactly the
+// keys Get can read.
+func leafKey(rel, suffix string) (string, bool) {
+	key, ok := strings.CutSuffix(rel, suffix)
+	if !ok {
+		return "", false
+	}
+	if storage.ValidateName(key) != nil {
+		return "", false
+	}
+	return key, true
+}
+
 // walkKeys lists the committed keys under root whose '/'-joined form has prefix,
 // returned lexicographically ascending and duplicate-free. It walks the tree,
-// skips directories and in-progress temp files (fsTmpPrefix), and maps each file's
-// path back to a key by stripping the root prefix and converting to slash form.
-// prefix is a raw substring filter, NOT a validated name (an empty prefix lists
-// all keys). The returned error is the raw walk fault; the caller wraps it in its
-// own typed IO error.
-func walkKeys(root, prefix string) ([]string, error) {
+// skips directories, and maps each leaf file back to its key with leafKey
+// (in-progress temp files, unsuffixed legacy files and foreign entries are not
+// leaves and are skipped). prefix is a raw substring filter on the decoded key,
+// NOT a validated name (an empty prefix lists all keys). The returned error is
+// the raw walk fault; the caller wraps it in its own typed IO error.
+func walkKeys(root, prefix, suffix string) ([]string, error) {
 	var out []string
 	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -96,10 +142,11 @@ func walkKeys(root, prefix string) ([]string, error) {
 		if d.IsDir() {
 			return nil
 		}
-		if strings.HasPrefix(d.Name(), fsTmpPrefix) {
-			return nil // a temp file mid-rename is not a committed key
+		rel := filepath.ToSlash(strings.TrimPrefix(path, root+string(os.PathSeparator)))
+		key, ok := leafKey(rel, suffix)
+		if !ok {
+			return nil // temp file mid-rename, legacy leaf, or foreign entry
 		}
-		key := filepath.ToSlash(strings.TrimPrefix(path, root+string(os.PathSeparator)))
 		if strings.HasPrefix(key, prefix) {
 			out = append(out, key)
 		}
@@ -109,7 +156,38 @@ func walkKeys(root, prefix string) ([]string, error) {
 		return nil, walkErr
 	}
 	// Keys are unique by path, so no dedup is needed; sort makes the listing
-	// canonical (WalkDir visits in lexical order, but sorting is a cheap guarantee).
+	// canonical (WalkDir's lexical order is over encoded names, where the
+	// suffix byte '@' sorts differently from '/', so the sort is load-bearing).
 	sort.Strings(out)
 	return out, nil
+}
+
+// findLegacyLeaf reports the first pre-v0.6.0 leaf file under root, if any. A
+// v0.5.x KV or Blobs backend stored key k at <root>/<k> with no suffix, so its
+// leaf's name is a valid storage segment. v0.6.0 never creates a non-directory
+// entry with such a name: its leaves end in an '@' suffix and its temp files
+// start with '.', both outside the segment grammar. So a non-directory entry
+// whose name is a valid segment is exactly a legacy leaf, and nothing else is
+// (dotfiles, uppercase names and temp leftovers are ignored). Empty legacy
+// directories carry no data and are reused as-is. The walk stops at the first
+// hit; a clean root costs one directory walk, the same as one Keys/List call.
+func findLegacyLeaf(root string) (string, bool, error) {
+	var found string
+	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if storage.ValidateName(d.Name()) == nil {
+			found = path
+			return fs.SkipAll
+		}
+		return nil
+	})
+	if walkErr != nil {
+		return "", false, walkErr
+	}
+	return found, found != "", nil
 }

@@ -16,7 +16,7 @@ import (
 // kvFilePath returns the on-disk path the KV backend maps key to, so a test can
 // inspect or corrupt the underlying file directly.
 func kvFilePath(root, key string) string {
-	return filepath.Join(root, "kv", filepath.FromSlash(key))
+	return filepath.Join(root, "kv", filepath.FromSlash(key)) + "@kv"
 }
 
 // TestKVRevHeaderOnDisk verifies the on-disk file layout: an 8-byte little-endian
@@ -171,8 +171,8 @@ func TestKVTempRenameNoPartial(t *testing.T) {
 		}
 		t.Fatalf("dir holds %d entries %v, want exactly the one committed file", len(entries), names)
 	}
-	if got := entries[0].Name(); got != "atomic" {
-		t.Errorf("committed file name = %q, want %q", got, "atomic")
+	if got := entries[0].Name(); got != "atomic@kv" {
+		t.Errorf("committed file name = %q, want %q", got, "atomic@kv")
 	}
 
 	// The committed content is the last successful write, unaffected by the reject.
@@ -219,11 +219,11 @@ func TestKVNamePathMapping(t *testing.T) {
 	cases := []struct {
 		label string
 		key   string
-		rel   []string // path segments under kv
+		rel   []string // path segments under kv; the leaf carries the "@kv" suffix
 	}{
-		{label: "single segment", key: "solo", rel: []string{"solo"}},
-		{label: "two segments", key: "a/b", rel: []string{"a", "b"}},
-		{label: "deep nesting", key: "deep/nested/key", rel: []string{"deep", "nested", "key"}},
+		{label: "single segment", key: "solo", rel: []string{"solo@kv"}},
+		{label: "two segments", key: "a/b", rel: []string{"a", "b@kv"}},
+		{label: "deep nesting", key: "deep/nested/key", rel: []string{"deep", "nested", "key@kv"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.label, func(t *testing.T) {

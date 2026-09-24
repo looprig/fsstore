@@ -59,6 +59,38 @@ func (e *OptionsError) Error() string {
 // nil for a pure validation failure such as an empty Root.
 func (e *OptionsError) Unwrap() error { return e.Cause }
 
+// ErrLegacyLayout is the sentinel every *LegacyLayoutError matches under
+// errors.Is. It means the store root holds KV or Blobs data written by fsstore
+// v0.5.x or earlier, whose on-disk layout v0.6.0 does not read.
+var ErrLegacyLayout = errors.New("fsstore: store root holds pre-v0.6.0 KV/Blobs data")
+
+// LegacyLayoutError reports that Open refused a store root because its kv/ or
+// blobs/ tree holds a leaf file in the pre-v0.6.0 layout. fsstore v0.6.0 changed
+// the KV and Blobs on-disk layout (every leaf file now carries an '@kv'/'@blob'
+// suffix so a key and a key extending it with "/..." can coexist) and ships NO
+// migration: old-layout data would otherwise be silently invisible (Get reports
+// not-found, Keys/List omit it) while new writes landed beside it. Open fails
+// closed instead, before any caller can read or write the root.
+//
+// Remedy: move or delete the old root (or at least its kv/ and blobs/ trees) and
+// open a fresh one; the data is not convertible in place by fsstore. Root is the
+// resolved store root, Primitive is "kv" or "blobs", and Path is the first legacy
+// leaf file found. It matches ErrLegacyLayout under errors.Is.
+type LegacyLayoutError struct {
+	Root      string
+	Primitive string
+	Path      string
+}
+
+func (e *LegacyLayoutError) Error() string {
+	return "fsstore: store root " + strconv.Quote(e.Root) + " holds pre-v0.6.0 " + e.Primitive +
+		" data (" + strconv.Quote(e.Path) + "); v0.6.0 changed the on-disk layout with no migration: " +
+		"move or delete the old root and open a fresh one"
+}
+
+// Unwrap returns ErrLegacyLayout so callers can classify with errors.Is.
+func (e *LegacyLayoutError) Unwrap() error { return ErrLegacyLayout }
+
 // Store is an open fsstore rooted at a single directory on the local filesystem.
 // It embeds *storage.Composite, so a caller reaches each primitive as a promoted
 // field — store.Ledger, store.Leaser, store.KV, store.Blobs, store.OrderedIndex — and hands the whole
@@ -85,6 +117,10 @@ type Store struct {
 // <root>/streams, <root>/leases, <root>/kv, <root>/blobs, <root>/ordered, each
 // created at 0700 by its constructor — and bundles them with
 // storage.NewCompositeWithOrderedIndex.
+//
+// Before bundling, Open scans kv/ and blobs/ and refuses a root that holds
+// pre-v0.6.0 KV/Blobs data with *LegacyLayoutError (errors.Is ErrLegacyLayout);
+// v0.6.0 changed that layout and does not migrate it.
 //
 // On any backend-construction failure Open returns that backend's typed error and
 // no Store; because every fs backend only creates directories (none holds an open
@@ -134,6 +170,9 @@ func Open(opts Options) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := refuseLegacyLayout(root, kv, blobs); err != nil {
+		return nil, err
+	}
 	ordered, err := newOrderedIndex(root)
 	if err != nil {
 		return nil, err
@@ -144,6 +183,30 @@ func Open(opts Options) (*Store, error) {
 		return nil, err
 	}
 	return &Store{Composite: composite, root: root, ledger: ledger, ordered: ordered}, nil
+}
+
+// refuseLegacyLayout fails Open closed when the kv/ or blobs/ tree holds a
+// pre-v0.6.0 (unsuffixed) leaf file, returning *LegacyLayoutError; see
+// findLegacyLeaf for why that test is exact. A walk fault is returned as the
+// primitive's typed IO error (Op "layout-scan") rather than treated as clean.
+// Only kv/ and blobs/ are scanned: the ledger, leaser and ordered backends
+// always suffixed their files and did not change layout.
+func refuseLegacyLayout(root string, kv *kvStore, blobs *blobStore) error {
+	path, found, err := findLegacyLeaf(kv.kv)
+	if err != nil {
+		return &KVIOError{Op: "layout-scan", Path: kv.kv, Cause: err}
+	}
+	if found {
+		return &LegacyLayoutError{Root: root, Primitive: "kv", Path: path}
+	}
+	path, found, err = findLegacyLeaf(blobs.blobs)
+	if err != nil {
+		return &BlobIOError{Op: "layout-scan", Path: blobs.blobs, Cause: err}
+	}
+	if found {
+		return &LegacyLayoutError{Root: root, Primitive: "blobs", Path: path}
+	}
+	return nil
 }
 
 // Backend returns the assembled five-primitive bundle to hand to a consumer such

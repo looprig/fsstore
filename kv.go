@@ -15,10 +15,12 @@ import (
 	"github.com/looprig/storage"
 )
 
-// This file implements storage.KV over the local filesystem: one file per key,
-// laid out as <root>/kv/<key> where the key's '/'-separated segments become
-// directory components. Each file is a small fixed rev header (the uint64 revision,
-// little-endian) followed by the raw value bytes:
+// This file implements storage.KV over the local filesystem: one file per key, laid
+// out as <root>/kv/<key>@kv where the key's '/'-separated segments become directory
+// components and the leaf file carries the kvLeafSuffix (see fswrite.go: the suffix
+// keeps a key's file disjoint from the directory holding the keys that extend it
+// with "/...", so "a" and "a/b" coexist). Each file is a small fixed rev header
+// (the uint64 revision, little-endian) followed by the raw value bytes:
 //
 //	[rev uint64 LE][value ...]
 //
@@ -141,9 +143,10 @@ func newKVStore(root string) (*kvStore, error) {
 
 // pathFor maps a storage key to its file path under kv and verifies the result
 // stays within kv (containment / defense in depth). The key's '/'-separated
-// segments become path components. Containment is LEXICAL: it assumes an
-// exclusively-owned root created at 0700 and does NOT resolve symlinks. Owning the
-// store root is the deployment's responsibility (identical to the ledger backend).
+// segments become path components; the leaf file gains kvLeafSuffix. Containment is
+// LEXICAL: it assumes an exclusively-owned root created at 0700 and does NOT
+// resolve symlinks. Owning the store root is the deployment's responsibility
+// (identical to the ledger backend).
 func (s *kvStore) pathFor(key string) (string, error) {
 	full := filepath.Clean(filepath.Join(s.kv, filepath.FromSlash(key)))
 	// The trailing separator in the prefix rejects both an escaping path and the kv
@@ -152,7 +155,7 @@ func (s *kvStore) pathFor(key string) (string, error) {
 	if !strings.HasPrefix(full, s.kv+string(os.PathSeparator)) {
 		return "", &KVPathError{Key: key, Path: full}
 	}
-	return full, nil
+	return full + kvLeafSuffix, nil
 }
 
 // lockFor returns the per-key mutex guarding key's read-check-write, creating the
@@ -261,7 +264,7 @@ func (s *kvStore) Put(ctx context.Context, key string, expectedRev uint64, val [
 // has not yet renamed (its temp file is skipped) or has committed (the new file is
 // listed), so the snapshot is always internally consistent.
 func (s *kvStore) Keys(ctx context.Context, prefix string) ([]string, error) {
-	out, err := walkKeys(s.kv, prefix)
+	out, err := walkKeys(s.kv, prefix, kvLeafSuffix)
 	if err != nil {
 		return nil, &KVIOError{Op: "walk", Path: s.kv, Cause: err}
 	}

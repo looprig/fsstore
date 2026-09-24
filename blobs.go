@@ -16,9 +16,11 @@ import (
 )
 
 // This file implements storage.Blobs over the local filesystem: one file per key,
-// laid out as <root>/blobs/<key> where the key's '/'-separated segments become
-// directory components. A blob file holds the raw bytes verbatim — no header — so
-// Get streams the object directly.
+// laid out as <root>/blobs/<key>@blob where the key's '/'-separated segments become
+// directory components and the leaf file carries the blobLeafSuffix (see
+// fswrite.go: the suffix keeps a key's file disjoint from the directory holding the
+// keys that extend it with "/...", so "a" and "a/b" coexist). A blob file holds the
+// raw bytes verbatim — no header — so Get streams the object directly.
 //
 // # Content-addressed immutability
 //
@@ -119,9 +121,10 @@ func newBlobStore(root string) (*blobStore, error) {
 
 // pathFor maps a storage key to its file path under blobs and verifies the result
 // stays within blobs (containment / defense in depth). The key's '/'-separated
-// segments become path components. Containment is LEXICAL: it assumes an
-// exclusively-owned root created at 0700 and does NOT resolve symlinks. Owning the
-// store root is the deployment's responsibility (identical to the ledger backend).
+// segments become path components; the leaf file gains blobLeafSuffix. Containment
+// is LEXICAL: it assumes an exclusively-owned root created at 0700 and does NOT
+// resolve symlinks. Owning the store root is the deployment's responsibility
+// (identical to the ledger backend).
 func (s *blobStore) pathFor(key string) (string, error) {
 	full := filepath.Clean(filepath.Join(s.blobs, filepath.FromSlash(key)))
 	// The trailing separator in the prefix rejects both an escaping path and the
@@ -130,7 +133,7 @@ func (s *blobStore) pathFor(key string) (string, error) {
 	if !strings.HasPrefix(full, s.blobs+string(os.PathSeparator)) {
 		return "", &BlobPathError{Key: key, Path: full}
 	}
-	return full, nil
+	return full + blobLeafSuffix, nil
 }
 
 // lockFor returns the per-key mutex guarding key's check-then-write, creating the
@@ -286,7 +289,7 @@ func (s *blobStore) Delete(ctx context.Context, key string) error {
 // keys. Per the contract, List does NOT validate prefix — a partial-segment prefix
 // is a substring filter, not a valid name. List takes no lock.
 func (s *blobStore) List(ctx context.Context, prefix string) ([]string, error) {
-	out, err := walkKeys(s.blobs, prefix)
+	out, err := walkKeys(s.blobs, prefix, blobLeafSuffix)
 	if err != nil {
 		return nil, &BlobIOError{Op: "walk", Path: s.blobs, Cause: err}
 	}

@@ -38,6 +38,28 @@ sess, err := sessionstore.Open(store.Backend()) // or store.Composite
 
 `Root` is required (an empty `Root` is rejected with an `*OptionsError`) and is created at
 `0700` if absent. Its layout is `streams/`, `leases/`, `kv/`, `blobs/`, and `ordered/`.
+
+Each primitive maps a name's `/`-separated segments onto directories and stores the name's
+leaf as a file carrying a suffix: `.log` (ledger), `.lock` (leaser), `.olog` (ordered index),
+`@kv` (KV) and `@blob` (Blobs). The KV and Blobs suffixes start with `@`, a byte the storage
+name grammar forbids, so a key's own file never shares a directory entry with the directory
+holding the keys that extend it: `sessions/a` (`kv/sessions/a@kv`) and `sessions/a/b`
+(`kv/sessions/a/b@kv`) coexist in either creation order, and a key that itself ends in `.kv`
+round-trips (`a.kv` → `kv/a.kv@kv`).
+
+### Breaking on-disk change in v0.6.0 (no migration)
+
+fsstore v0.5.x and earlier stored KV and Blobs leaves **without** a suffix, which made a key
+and its `/` extension unable to coexist. v0.6.0 changed the layout and ships **no migration**.
+`Open` scans `kv/` and `blobs/` and **fails closed** with `*fsstore.LegacyLayoutError`
+(`errors.Is(err, fsstore.ErrLegacyLayout)`; it carries `Root`, `Primitive` and the first
+legacy `Path`) when it finds a pre-v0.6.0 leaf, so old data is never silently invisible or
+half-read. To proceed, **move or delete the old store root** (or its `kv/` and `blobs/` trees)
+and open a fresh one. Ledger, lease and ordered-index files did not change layout. A root
+written by v0.6.0 is misread by v0.5.x (`Get` finds nothing; `Keys`/`List` report suffixed
+names that are not valid keys), so never roll a data directory back; a v0.5.x write into a
+v0.6.0 root makes the next v0.6.0 `Open` refuse it.
+
 `Close` releases the ledger cache and OrderedIndex namespace views and is idempotent; after
 `Close` the `Store` must not be reused.
 

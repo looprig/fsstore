@@ -16,7 +16,7 @@ import (
 // blobFilePath returns the on-disk path the Blobs backend maps key to, so a test
 // can inspect or corrupt the underlying file directly.
 func blobFilePath(root, key string) string {
-	return filepath.Join(root, "blobs", filepath.FromSlash(key))
+	return filepath.Join(root, "blobs", filepath.FromSlash(key)) + "@blob"
 }
 
 // TestBlobsIdenticalNoOpVsConflict checks the content-addressed re-Put semantics at
@@ -121,12 +121,12 @@ func TestBlobsTempRenameNoPartial(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadDir: %v", err)
 	}
-	if len(entries) != 1 || entries[0].Name() != "atomic" {
+	if len(entries) != 1 || entries[0].Name() != "atomic@blob" {
 		var names []string
 		for _, e := range entries {
 			names = append(names, e.Name())
 		}
-		t.Fatalf("dir holds %v, want exactly the one committed file %q", names, "atomic")
+		t.Fatalf("dir holds %v, want exactly the one committed file %q", names, "atomic@blob")
 	}
 }
 
@@ -180,11 +180,11 @@ func TestBlobsNamePathMapping(t *testing.T) {
 	cases := []struct {
 		label string
 		key   string
-		rel   []string // path segments under blobs
+		rel   []string // path segments under blobs; the leaf carries the "@blob" suffix
 	}{
-		{label: "single segment", key: "solo", rel: []string{"solo"}},
-		{label: "two segments", key: "a/b", rel: []string{"a", "b"}},
-		{label: "deep nesting", key: "deep/nested/key", rel: []string{"deep", "nested", "key"}},
+		{label: "single segment", key: "solo", rel: []string{"solo@blob"}},
+		{label: "two segments", key: "a/b", rel: []string{"a", "b@blob"}},
+		{label: "deep nesting", key: "deep/nested/key", rel: []string{"deep", "nested", "key@blob"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.label, func(t *testing.T) {

@@ -154,6 +154,8 @@ func TestOrderedIndexProductionHasNoUnapprovedDirectoryEnumeration(t *testing.T)
 	parsed := 0
 	allowedWalkImplementations := 0
 	allowedWalkCalls := 0
+	allowedLegacyScanImplementations := 0
+	allowedLegacyScanCalls := 0
 	for _, path := range paths {
 		if strings.HasSuffix(path, "_test.go") {
 			continue
@@ -189,6 +191,15 @@ func TestOrderedIndexProductionHasNoUnapprovedDirectoryEnumeration(t *testing.T)
 				if !ok {
 					return true
 				}
+				if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "findLegacyLeaf" {
+					if path == "fsstore.go" && function.Name.Name == "refuseLegacyLayout" {
+						allowedLegacyScanCalls++
+						return true
+					}
+					position := fileSet.Position(ident.Pos())
+					t.Errorf("unapproved findLegacyLeaf call: %s:%d %s", path, position.Line, function.Name.Name)
+					return true
+				}
 				if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "walkKeys" {
 					if (path == "kv.go" && function.Name.Name == "Keys") ||
 						(path == "blobs.go" && function.Name.Name == "List") {
@@ -221,6 +232,12 @@ func TestOrderedIndexProductionHasNoUnapprovedDirectoryEnumeration(t *testing.T)
 					allowedWalkImplementations++
 					return true
 				}
+				// findLegacyLeaf is Open's one-shot pre-v0.6.0 layout scan of
+				// kv/ and blobs/; it never runs on an OrderedIndex path.
+				if path == "fswrite.go" && function.Name.Name == "findLegacyLeaf" && qualifier == "path/filepath" && selector.Sel.Name == "WalkDir" {
+					allowedLegacyScanImplementations++
+					return true
+				}
 				position := fileSet.Position(selector.Pos())
 				t.Errorf("unapproved directory enumeration: %s:%d %s calls %s.%s", path, position.Line, function.Name.Name, ident.Name, selector.Sel.Name)
 				return true
@@ -235,6 +252,12 @@ func TestOrderedIndexProductionHasNoUnapprovedDirectoryEnumeration(t *testing.T)
 	}
 	if allowedWalkCalls != 2 {
 		t.Fatalf("approved KV.Keys/Blobs.List walkKeys calls = %d, want 2", allowedWalkCalls)
+	}
+	if allowedLegacyScanImplementations != 1 {
+		t.Fatalf("approved fswrite.go/findLegacyLeaf filepath.WalkDir calls = %d, want 1", allowedLegacyScanImplementations)
+	}
+	if allowedLegacyScanCalls != 2 {
+		t.Fatalf("approved refuseLegacyLayout findLegacyLeaf calls = %d, want 2", allowedLegacyScanCalls)
 	}
 }
 
