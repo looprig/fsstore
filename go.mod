@@ -1,5 +1,5 @@
 module github.com/looprig/fsstore
 
-go 1.26.8
+go 1.26.9
 
-require github.com/looprig/storage v0.7.0
+require github.com/looprig/storage v0.9.1

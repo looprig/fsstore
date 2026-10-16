@@ -137,7 +137,7 @@ provider: `sessionstore.Open` fails before any I/O with
 
 ## Development
 
-The baseline is Go 1.26.8. Verify the module standalone, never against a workspace:
+The baseline is Go 1.26.9. Verify the module standalone, never against a workspace:
 
 ```sh
 GOWORK=off go test ./...
